@@ -2,7 +2,7 @@
 
 开源、AI 原生的中文输入法，先做 macOS。Rust + [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui)。
 
-早期版本，AI 功能还没做。路线图见 [docs/PLAN.md](docs/PLAN.md)，更新记录见 [CHANGELOG.md](CHANGELOG.md)。
+早期版本，AI 功能还没做。路线图见 [docs/PLAN.md](docs/PLAN.md)，引擎设计见 [docs/ENGINE.md](docs/ENGINE.md)，更新记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 功能
 
@@ -63,7 +63,7 @@ cargo run --release -p kyme-pinyin --example repl -- data/rime-ice/8105.dict.yam
 | `eval`、`qa` | 评测用例、按键场景、门槛、人工检查清单 |
 | `scripts` | 下载词库、打包、安装、生成图标 |
 | `data` | 数据来源登记 |
-| `docs` | 计划书、QA 说明 |
+| `docs` | 计划书、引擎设计、QA 说明 |
 
 ## 许可
 
