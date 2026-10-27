@@ -1,0 +1,9 @@
+[package]
+name = "kyme-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gpui.workspace = true
+kyme-core = { version = "0.1.0", path = "../kyme-core" }

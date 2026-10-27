@@ -1,0 +1,73 @@
+# 人工检查清单：自动测试顾不到的 App 兼容性和观感，每次发版前过一遍。
+# cargo xtask qa --release（或 --manual）会逐项提示，结果写进报告。
+# 测之前先在对应的 App 里切到 Kyme 拼音。发现新的兼容性问题，就在这里加一项。
+
+[[check]]
+app = "备忘录"
+steps = "新建一条备忘录，输入 nihao 按空格，再输入 women 按回车"
+expect = "先上屏「你好」，再上屏字母 women；候选窗贴在输入行正下方"
+
+[[check]]
+app = "Safari"
+steps = "在地址栏和任意网页的输入框里，各先打几个字上屏，再输入 nihao 按 5 次退格"
+expect = "退格只删拼音，删光后输入结束；之前上屏的字一个都没少"
+
+[[check]]
+app = "Chrome"
+steps = "在地址栏和任意网页的输入框里，各先打几个字上屏，再输入 nihao 按 5 次退格，最后输入 shijie 按空格"
+expect = "退格只删拼音、不删前面的字（Chromium 会先把退格交给网页，最容易出这个问题）；最后上屏「世界」"
+
+[[check]]
+app = "VS Code"
+steps = "在编辑器里输入 woshizhongguoren 按空格，再换一行输入 nihao 按回车"
+expect = "上屏「我是中国人」和字母 nihao；候选窗一直跟着光标，不会停在窗口角落"
+
+[[check]]
+app = "终端 / iTerm2"
+steps = "输入 nihao 后按 Esc，再输入 nihao 按空格"
+expect = "输入过程中终端里不会冒出原样的字母；Esc 后什么都不留；最后上屏「你好」"
+
+[[check]]
+app = "微信"
+steps = "在聊天输入框里输入 nihao 按回车"
+expect = "只上屏字母 nihao，消息没有被发出去；再按一次回车才发送"
+
+[[check]]
+app = "飞书"
+steps = "在聊天输入框里输入 nihao 按回车"
+expect = "只上屏字母 nihao，消息没有被发出去"
+
+[[check]]
+app = "JetBrains IDE"
+steps = "在编辑器里输入 nihao 按空格"
+expect = "上屏「你好」，候选窗在光标旁边"
+
+[[check]]
+app = "Spotlight"
+steps = "按 ⌘空格 打开 Spotlight，输入 nihao"
+expect = "候选窗显示在 Spotlight 输入框下方，没有被挡住"
+
+[[check]]
+app = "密码框"
+steps = "在任意网页的密码框里输入几个字母"
+expect = "不弹出候选窗，字母直接输入（系统在密码框里会临时停用输入法）"
+
+[[check]]
+app = "屏幕边缘、多显示器、全屏"
+steps = "把输入光标放到屏幕最下方再输入；再到副屏和全屏 App 里各输入一次"
+expect = "下方放不下时候选窗翻到输入行上方、不超出屏幕；候选窗总在光标所在的那块屏幕上"
+
+[[check]]
+app = "浅色 / 深色模式"
+steps = "分别在浅色和深色模式下输入 nihao"
+expect = "候选窗文字清楚；菜单栏的 Kyme 图标在两种模式下都看得清"
+
+[[check]]
+app = "中英切换提示"
+steps = "轻点一下 Shift，再点一下"
+expect = "光标旁依次短暂显示「英」「中」，约 0.7 秒后消失；中英状态跟着切换"
+
+[[check]]
+app = "设置"
+steps = "把 ~/Library/Application Support/Kyme/settings.toml 改成 page_size = 3、highlight_color = \"#07C160\"，保存后切换一下输入框再输入"
+expect = "候选变成每页 3 个，高亮变成绿色；改回去后恢复"

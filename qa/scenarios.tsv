@@ -1,0 +1,48 @@
+# 按键场景：在输入框里按一串键，检查最后输入框里的文字。cargo xtask qa 先在模拟的输入框里跑，
+# 再用 Kyme --qa 在 macOS 接入层逐键对照：键接没接、上屏的文字、输入中的文字、候选窗是否贴在光标旁。
+#
+# 格式：名称<TAB>按键<TAB>期望的文字（期望为空可以不写第三列）
+# 按键：普通字符直接写，要按 Shift 的字符（大写字母、@、" 等）会自动带上 Shift；特殊键写在花括号里：
+#   {space} {enter} {bs} {esc} {left} {right} {up} {down} {pgup} {pgdn}
+#   {shift} 轻点 Shift，{shift-down} {shift-up} 分开按下和松开，{wait:500} 停 500 毫秒
+#   {cmd+c} 这类快捷键（别用会改文字的，比如 cmd+a、cmd+v），{{ 是字面的 {
+# 方向键只能在输入中用：模拟的输入框不移动光标。
+#
+# 场景按顺序在同一个会话里跑，和真实输入法一样会延续状态（比如引号的左右要成对）。
+# 每个场景开始前清空输入框，结束后按一次 Esc，最后要回到中文状态。
+# 期望不能依赖设置（每页候选数、内嵌拼音）。
+# 用户报的 bug，先在这里加一条能复现的场景，再去修。
+
+空格上屏整句	nihaoshijie{space}	你好世界
+长句	woshizhongguoren{space}	我是中国人
+超过 6 个音节的词	zhonghuarenmingongheguo{space}	中华人民共和国
+数字键选词	nihao1	你好
+连续两次上屏	nihao{space}shijie{space}	你好世界
+回车上屏字母，不换行	nihao{enter}	nihao
+Esc 取消输入	nihao{esc}	
+输入中退格只删拼音	nihao{space}wo{bs}{bs}	你好
+删光拼音之后的退格才交给 App	nihao{space}ni{bs}{bs}{bs}	你
+大写字母在输入中当小写	niHao{space}	你好
+撇号分隔音节	xi'an{space}	西安
+简拼	rgzn{space}	人工智能
+纠错：相邻字母打反	zhnogguo{space}	中国
+两个相同元音能切成两个音节时不当成多按了一下	naanni{space}	那按你
+翻页再翻回	ni{pgdn}{pgup}{space}	你
+等号减号翻页	ni=-{space}	你
+左右移动高亮	ni{right}{left}{space}	你
+输入中方向键不影响已上屏的字	nihao{space}ni{right}{left}{space}	你好你
+输入中按标点：首选上屏再接中文标点	nihao,	你好，
+空闲时的中文标点	,.?!	，。？！
+引号成对	"nihao"	“你好”
+括号	(nihao)	（你好）
+书名号	<shijie>	《世界》
+数字直接上屏	123	123
+数字后的点保持半角	3.14	3.14
+数字后的逗号保持半角	1,000	1,000
+输入中按没有中文标点的符号：原样接上	nihao/	你好/
+输入中按 @	shijie@	世界@
+轻点 Shift 切英文再切回	{shift}hello{shift}nihao{space}	hello你好
+输入中轻点 Shift：拼音按字母上屏	nihao{shift}{shift}	nihao
+长按 Shift 不切换	{shift-down}{wait:500}{shift-up}nihao{space}	你好
+Shift 加字母不切换	Anihao{space}	A你好
+快捷键不打断输入	nihao{cmd+c}{space}	你好

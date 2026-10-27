@@ -1,0 +1,14 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+gpui = { version = "=0.2.2", features = ["runtime_shaders"] }
+
+[profile.release]
+debug = "line-tables-only"

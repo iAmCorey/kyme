@@ -1,0 +1,3 @@
+# 和现有写法保持一致：短结构体、短 if/else 写在一行
+max_width = 120
+use_small_heuristics = "Max"

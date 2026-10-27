@@ -1,0 +1,10 @@
+[package]
+name = "kyme-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kyme-pinyin = { version = "0.1.0", path = "../kyme-pinyin" }
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.8"

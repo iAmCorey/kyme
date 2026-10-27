@@ -1,0 +1,3 @@
+[alias]
+# cargo xtask qa：发版前的整套检查，见 docs/QA.md。用 release 编译，评测里的耗时才有意义
+xtask = "run --release -q -p xtask --"

@@ -1,0 +1,22 @@
+[package]
+name = "kyme-macos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+core-foundation = "0.10"
+core-graphics = "0.24"
+dispatch2 = "0.3.1"
+gpui.workspace = true
+kyme-core = { version = "0.1.0", path = "../kyme-core" }
+kyme-ui = { version = "0.1.0", path = "../kyme-ui" }
+log = "0.4"
+objc2 = "0.6"
+objc2-app-kit = "0.3"
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGWindowLevel"] }
+objc2-foundation = "0.3"
+objc2-input-method-kit = "0.3.2"
+raw-window-handle = "0.6"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"

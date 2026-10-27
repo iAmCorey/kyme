@@ -1,0 +1,102 @@
+# 拼音引擎评测集：类别<TAB>输入<TAB>期望的首选
+# 每一条都必须打对，cargo xtask qa 才算通过；暂时还做不到的放进 eval/pending.tsv（只报告，不卡发版）。
+# 「本来就对」这一类是本来就该打对的输入，其余几类是各种打错的情况。
+# 跑法：cargo xtask qa --only eval
+
+本来就对	nihao	你好
+本来就对	nihaoshijie	你好世界
+本来就对	woxiangquchifan	我想去吃饭
+本来就对	jintiantianqizhenhao	今天天气真好
+本来就对	jintianshigehaorizi	今天是个好日子
+本来就对	wobuzhidaozenmeban	我不知道怎么办
+本来就对	chuangqianmingyueguang	床前明月光
+本来就对	womenyiqiqukandianying	我们一起去看电影
+本来就对	zheshiyigeceshi	这是一个测试
+本来就对	ruguoniyuanyi	如果你愿意
+本来就对	rengongzhineng	人工智能
+本来就对	shenmeshihou	什么时候
+本来就对	beijingdaxue	北京大学
+本来就对	zhongguoren	中国人
+本来就对	zhongguo	中国
+本来就对	shijie	世界
+本来就对	women	我们
+本来就对	tianqi	天气
+本来就对	dianhua	电话
+本来就对	xiexie	谢谢
+本来就对	duibuqi	对不起
+本来就对	meiguanxi	没关系
+本来就对	wohenhao	我很好
+本来就对	nishishei	你是谁
+本来就对	zaijian	再见
+本来就对	mingtianjian	明天见
+本来就对	keyi	可以
+本来就对	bukeyi	不可以
+本来就对	haode	好的
+本来就对	xiaoxi	消息
+本来就对	gongzuo	工作
+本来就对	xuexi	学习
+本来就对	shouji	手机
+本来就对	diannao	电脑
+本来就对	shurufa	输入法
+本来就对	kaihui	开会
+本来就对	dianying	电影
+本来就对	xian	先
+本来就对	xi'an	西安
+本来就对	dan	但
+本来就对	nan	难
+本来就对	an	按
+本来就对	zhongg	中国
+本来就对	zgr	中国人
+本来就对	bjdx	北京大学
+本来就对	jinnian	今年
+本来就对	gonggong	公共
+本来就对	xinnian	新年
+本来就对	ganggang	刚刚
+本来就对	dangran	当然
+本来就对	rgzn	人工智能
+本来就对	dxs	大学生
+本来就对	hengmeilengduiqianfuzhi	横眉冷对千夫指
+本来就对	zhonghuarenmingongheguo	中华人民共和国
+本来就对	naanni	那按你
+本来就对	naanshuo	那按说
+
+相邻打反	zhnog	中
+相邻打反	zhogn	中
+相邻打反	nihoa	你好
+相邻打反	xinag	想
+相邻打反	gaun	关
+相邻打反	xeu	学
+相邻打反	zhnogguo	中国
+相邻打反	wodemignzi	我的名字
+相邻打反	jintianitanqizhenhao	今天天气真好
+相邻打反	shuruaf	输入法
+
+漏字母	zhngguo	中国
+漏字母	jintiantinqi	今天天气
+漏字母	dianyng	电影
+漏字母	beijngdaxue	北京大学
+漏字母	womn	我们
+漏字母	xiexe	谢谢
+
+多字母	zhoong	中
+多字母	nihhao	你好
+多字母	xiaang	想
+多字母	xiiang	想
+多字母	shhurufa	输入法
+多字母	dianyiing	电影
+多字母	womenndou	我们都
+
+按错相邻键	zhonf	中
+按错相邻键	nihap	你好
+按错相邻键	xiamg	想
+按错相邻键	shurufs	输入法
+按错相邻键	wpmen	我们
+
+跨音节打反	nhiao	你好
+跨音节打反	wmoen	我们
+跨音节打反	tiaqni	天气
+跨音节打反	shjiie	世界
+
+元音开头的简拼	eq	而且
+元音开头的简拼	aq	安全
+元音开头的简拼	oz	欧洲
