@@ -1,8 +1,11 @@
 //! 拼音 → 候选：音节切分（含简拼、末尾没打完的音节、打字纠错）、查词、按一元词频组整句。
 
 use std::collections::HashSet;
+use std::fs;
+use std::path::{Path, PathBuf};
 
-use crate::dict::Dictionary;
+use crate::dict::{Dictionary, LoadError, read_file};
+use crate::emoji::Emoji;
 use crate::syllable::{SylId, SylSet, SyllableTable};
 
 /// 一个词最多跨几个音节。
@@ -283,15 +286,40 @@ enum Step {
 
 pub struct Engine {
     dict: Dictionary,
+    emoji: Emoji,
 }
 
 impl Engine {
     pub fn new(dict: Dictionary) -> Self {
-        Engine { dict }
+        Engine { dict, emoji: Emoji::default() }
+    }
+
+    /// 读一个数据目录：全部 `.dict.yaml`（按文件名排序）和 emoji 对照表 `emoji.txt`。
+    /// 输入法读安装包里的 dict/，QA 读仓库的 data/rime-ice/，两处放的是同一套文件。
+    pub fn load_dir(dir: &Path) -> Result<Self, LoadError> {
+        let mut paths: Vec<PathBuf> = fs::read_dir(dir)
+            .map_err(|source| LoadError::new(dir, source))?
+            .filter_map(|entry| Some(entry.ok()?.path()))
+            .filter(|path| path.to_string_lossy().ends_with(".dict.yaml"))
+            .collect();
+        paths.sort();
+        let dict = Dictionary::load_rime(&paths)?;
+        let emoji = Emoji::parse(&read_file(&dir.join("emoji.txt"))?);
+        Ok(Engine::new(dict).with_emoji(emoji))
+    }
+
+    /// 带上 emoji 对照表。`convert` 不用它，由输入会话决定要不要把 emoji 放进候选。
+    pub fn with_emoji(mut self, emoji: Emoji) -> Self {
+        self.emoji = emoji;
+        self
     }
 
     pub fn dictionary(&self) -> &Dictionary {
         &self.dict
+    }
+
+    pub fn emoji(&self) -> &Emoji {
+        &self.emoji
     }
 
     /// 把一串拼音（小写字母，可用 `'` 分隔）转成候选。第一个候选是整句最优解。

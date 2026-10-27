@@ -17,9 +17,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.0</string>
+	<string>0.0.2</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>2</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>LSBackgroundOnly</key>
@@ -40,7 +40,7 @@
 		<string>Latn</string>
 	</array>
 	<key>tsInputMethodIconFileKey</key>
-	<string>kyme.tiff</string>
+	<string>kyme.pdf</string>
 	<key>ComponentInputModeDict</key>
 	<dict>
 		<key>tsInputModeListKey</key>
@@ -62,11 +62,11 @@
 				<key>tsInputModeIsVisibleKey</key>
 				<true/>
 				<key>tsInputModeMenuIconFileKey</key>
-				<string>kyme.tiff</string>
+				<string>kyme.pdf</string>
 				<key>tsInputModeAlternateMenuIconFileKey</key>
-				<string>kyme.tiff</string>
+				<string>kyme.pdf</string>
 				<key>tsInputModePaletteIconFileKey</key>
-				<string>kyme.tiff</string>
+				<string>kyme.pdf</string>
 				<key>tsInputModePrimaryInScriptKey</key>
 				<true/>
 				<key>tsInputModeScriptKey</key>

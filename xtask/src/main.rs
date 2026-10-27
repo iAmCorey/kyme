@@ -15,13 +15,12 @@ mod report;
 mod scenario;
 mod util;
 
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kyme_core::pinyin::{Dictionary, Engine};
+use kyme_core::pinyin::Engine;
 
 use crate::gates::Gates;
 use crate::report::{Outcome, Report, Status};
@@ -168,22 +167,15 @@ impl Context {
     }
 }
 
-/// 和输入法一样：读 data/rime-ice/ 下全部 .dict.yaml，按文件名排序。安装包里放的也是这些文件。
+/// 先确保数据下载好，再和输入法一样用 `Engine::load_dir` 读 data/rime-ice/。安装包里放的也是这个目录。
 fn load_engine(root: &Path) -> Result<Loaded, String> {
     util::capture(Command::new(root.join("scripts/fetch-dict.sh")).current_dir(root))
         .map_err(|out| format!("下载词库失败：{}", util::tail(&out, 3).join(" / ")))?;
-    let dir = root.join("data/rime-ice");
-    let mut paths: Vec<PathBuf> = fs::read_dir(&dir)
-        .map_err(|err| format!("读不了 {}：{err}", dir.display()))?
-        .filter_map(|entry| Some(entry.ok()?.path()))
-        .filter(|path| path.to_string_lossy().ends_with(".dict.yaml"))
-        .collect();
-    paths.sort();
     let started = Instant::now();
-    let dict = Dictionary::load_rime(&paths).map_err(|err| err.to_string())?;
+    let engine = Engine::load_dir(&root.join("data/rime-ice")).map_err(|err| err.to_string())?;
     let load_time = started.elapsed();
-    let entries = dict.len();
-    Ok(Loaded { engine: Arc::new(Engine::new(dict)), entries, load_time })
+    let entries = engine.dictionary().len();
+    Ok(Loaded { engine: Arc::new(engine), entries, load_time })
 }
 
 fn qa(args: &[String]) -> ExitCode {

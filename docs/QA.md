@@ -86,8 +86,8 @@ macOS 启用第三方输入法时会弹窗「允许 Kyme 启用 Kyme 拼音？�
 
 ## 发版流程
 
-1. 改版本号：`Cargo.toml` 的 `workspace.package.version` 和 `crates/kyme-macos/bundle/Info.plist` 的 `CFBundleShortVersionString`，安装包检查会核对两边一致。
-2. 提交。
+1. 改版本号：`Cargo.toml` 的 `workspace.package.version`，和 `crates/kyme-macos/bundle/Info.plist` 的 `CFBundleShortVersionString`（`CFBundleVersion` 加 1）。安装包检查会核对两边一致。
+2. 在 `CHANGELOG.md` 里把「未发布」改成版本号和日期，然后提交。
 3. 在发版用的机器上跑 `cargo xtask qa --release`，全部通过。
 4. 把 `target/qa/` 下这次的报告随版本存档。
 5. 打 tag、发布。签名公证和安装包到 Phase 4 再补进这个流程。

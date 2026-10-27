@@ -1,13 +1,17 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kyme_pinyin::{Conversion, Engine};
+use kyme_pinyin::{Candidate, Conversion, Engine};
 
 use crate::punct::Punctuation;
 use crate::settings::Settings;
 
 /// 轻点 Shift 切换中英：按下到松开不能超过这么久，中间也不能按别的键。
 const SHIFT_TAP: Duration = Duration::from_millis(400);
+
+/// 选候选的键，按顺序对应本页第 1、2…… 个候选。每页最多也就这么多个候选。
+pub const SELECT_KEYS: &str = "1234567890";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -152,6 +156,13 @@ impl Session {
 
         let composing = self.is_composing();
         let after_digit = std::mem::replace(&mut self.after_digit, false);
+        if composing
+            && let Key::Char(c) = key
+            && let Some(slot) = SELECT_KEYS.find(c)
+            && slot < self.page_size()
+        {
+            return self.select(self.page() * self.page_size() + slot);
+        }
         match key {
             Key::Char(c) if c.is_ascii_lowercase() || (composing && c.is_ascii_uppercase()) => {
                 self.input.push(c.to_ascii_lowercase());
@@ -165,14 +176,8 @@ impl Session {
                 }
                 self.handled(None)
             }
-            Key::Char(c @ '1'..='9') if composing => {
-                let offset = c as usize - '1' as usize;
-                if offset < self.page_size() {
-                    self.select(self.page() * self.page_size() + offset)
-                } else {
-                    self.handled(None)
-                }
-            }
+            // 本页没有这么多候选：1–9 什么都不做，0 往下按普通字符处理（首选上屏，再接上 0）
+            Key::Char('1'..='9') if composing => self.handled(None),
             Key::Char('-') | Key::Up | Key::PageUp if composing => {
                 self.turn_page(false);
                 self.handled(None)
@@ -352,7 +357,27 @@ impl Session {
 
     fn refresh(&mut self) {
         self.conversion = self.engine.convert(&self.input);
+        if self.settings.input.emoji {
+            self.add_emoji();
+        }
         self.highlight = 0;
+    }
+
+    /// 和整串拼音对得上的候选后面，跟上它对应的 emoji，选中时一样消耗整串拼音。
+    /// 只消耗了一部分拼音的候选不带，首选永远是字。
+    fn add_emoji(&mut self) {
+        let emoji = self.engine.emoji();
+        let mut shown = HashSet::new();
+        let mut candidates = Vec::with_capacity(self.conversion.candidates.len());
+        for candidate in std::mem::take(&mut self.conversion.candidates) {
+            let matched = if candidate.consumed == self.input.len() { emoji.get(&candidate.text) } else { &[] };
+            let consumed = candidate.consumed;
+            candidates.push(candidate);
+            for text in matched.iter().filter(|text| shown.insert(text.as_str())) {
+                candidates.push(Candidate { text: text.clone(), consumed });
+            }
+        }
+        self.conversion.candidates = candidates;
     }
 
     fn clear(&mut self) {
@@ -373,7 +398,7 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    use kyme_pinyin::Dictionary;
+    use kyme_pinyin::{Dictionary, Emoji};
 
     use super::*;
 
@@ -467,21 +492,63 @@ mod tests {
         assert_eq!(panel.preedit, "ni'hao");
     }
 
+    /// ni 有 11 个候选，每页最多 10 个也翻得了页。词频从高到低：你拟泥尼妮倪霓逆腻溺匿。
+    fn session_with_many_candidates(page_size: usize) -> Session {
+        let sample: String = "你拟泥尼妮倪霓逆腻溺匿"
+            .chars()
+            .enumerate()
+            .map(|(i, c)| format!("{c}\tni\t{}\n", 1000 - i * 10))
+            .collect();
+        let mut s = Session::new(Arc::new(Engine::new(Dictionary::from_rime_sources(&[&sample]))));
+        let mut settings = Settings::default();
+        settings.input.page_size = page_size;
+        s.set_settings(settings);
+        s
+    }
+
     #[test]
     fn page_size_option() {
-        let mut s = session();
-        let mut settings = Settings::default();
-        settings.input.page_size = 2;
-        s.set_settings(settings);
+        let mut s = session_with_many_candidates(5);
         type_str(&mut s, "ni");
         let View::Composing { panel, .. } = s.view() else { panic!() };
-        assert_eq!(panel.candidates.len(), 2);
+        assert_eq!(panel.candidates.len(), 5);
         assert!(panel.has_next);
-        let r = press(&mut s, Key::Char('3'));
+        let r = press(&mut s, Key::Char('6'));
         assert_eq!(r.commit, None, "超出本页的数字键不选词");
         press(&mut s, Key::Char('='));
         let View::Composing { panel, .. } = s.view() else { panic!() };
         assert!(panel.has_prev);
+    }
+
+    #[test]
+    fn zero_selects_the_tenth_candidate() {
+        let mut s = session_with_many_candidates(10);
+        type_str(&mut s, "ni");
+        assert_eq!(press(&mut s, Key::Char('0')).commit.as_deref(), Some("溺"));
+
+        // 每页不到 10 个时 0 不选字：首选上屏，再接上 0
+        let mut s = session();
+        type_str(&mut s, "ni");
+        assert_eq!(press(&mut s, Key::Char('0')).commit.as_deref(), Some("你0"));
+    }
+
+    #[test]
+    fn emoji_follow_words_matching_the_whole_input() {
+        let emoji = Emoji::parse("你好\t你好 👋\n你\t你 👉\n");
+        let engine = Engine::new(Dictionary::from_rime_sources(&[SAMPLE])).with_emoji(emoji);
+        let mut s = Session::new(Arc::new(engine));
+        type_str(&mut s, "nihao");
+        let View::Composing { panel, .. } = s.view() else { panic!() };
+        assert_eq!(panel.candidates[..2], ["你好", "👋"]);
+        assert!(!panel.candidates.iter().any(|c| c == "👉"), "只消耗了 ni 的「你」不带 emoji");
+        assert_eq!(press(&mut s, Key::Char('2')).commit.as_deref(), Some("👋"), "选 emoji 消耗整串拼音");
+
+        let mut settings = Settings::default();
+        settings.input.emoji = false;
+        s.set_settings(settings);
+        type_str(&mut s, "nihao");
+        let View::Composing { panel, .. } = s.view() else { panic!() };
+        assert!(!panel.candidates.iter().any(|c| c == "👋"), "设置里关掉就不带");
     }
 
     #[test]

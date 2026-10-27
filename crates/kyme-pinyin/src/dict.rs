@@ -59,6 +59,17 @@ impl std::error::Error for LoadError {
     }
 }
 
+impl LoadError {
+    pub(crate) fn new(path: &Path, source: io::Error) -> Self {
+        LoadError { path: path.display().to_string(), source }
+    }
+}
+
+/// 读整个文件，出错时带上路径。
+pub(crate) fn read_file(path: &Path) -> Result<String, LoadError> {
+    fs::read_to_string(path).map_err(|source| LoadError::new(path, source))
+}
+
 struct Row<'a> {
     text: &'a str,
     code: &'a str,
@@ -116,13 +127,7 @@ fn equal_range(sorted: &[u64], key: u64) -> std::ops::Range<usize> {
 
 impl Dictionary {
     pub fn load_rime<P: AsRef<Path>>(paths: &[P]) -> Result<Self, LoadError> {
-        let mut contents = Vec::with_capacity(paths.len());
-        for path in paths {
-            let path = path.as_ref();
-            let content =
-                fs::read_to_string(path).map_err(|source| LoadError { path: path.display().to_string(), source })?;
-            contents.push(content);
-        }
+        let contents = paths.iter().map(|path| read_file(path.as_ref())).collect::<Result<Vec<_>, _>>()?;
         Ok(Self::from_rime_sources(&contents.iter().map(String::as_str).collect::<Vec<_>>()))
     }
 

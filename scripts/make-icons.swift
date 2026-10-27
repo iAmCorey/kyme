@@ -1,6 +1,6 @@
 // 生成 Kyme 的图标，放进 crates/kyme-macos/bundle/Resources/：
 //   AppIcon.icns  App 图标（Finder、系统授权弹窗）
-//   kyme.tiff     菜单栏和输入法列表里的模板图（16pt，1 倍、2 倍各一张）
+//   kyme.pdf      菜单栏和输入法列表里的模板图（16pt 矢量图）
 // 生成的文件提交进 git，平时构建用不到这个脚本。改了下面的图形之后跑一次：swift scripts/make-icons.swift
 //
 // 图形：一颗白色键帽，键面正中是「|<」形的 K。一竖是蓝色的输入光标，两撇是候选窗默认的高亮紫。
@@ -103,30 +103,25 @@ func drawAppIcon(_ ctx: CGContext, scale s: CGFloat) {
     fill(ctx, k.arms, rgb(0x5E5CE6))
 }
 
-/// 菜单栏图标，16×16pt：圆角方块里镂空出 K。系统只看不透明度，颜色跟着菜单栏走。
-func drawMenuIcon(_ ctx: CGContext) {
-    fill(ctx, squircle(CGRect(x: 0.5, y: 0.5, width: 15, height: 15), radius: 3.3), rgb(0))
-    let k = caretK(CGRect(x: 4.2, y: 3.6, width: 7.8, height: 8.8), width: 2.1, gap: 1.0)
-    ctx.setBlendMode(.clear)
-    fill(ctx, k.stem, rgb(0))
-    fill(ctx, k.arms, rgb(0))
+/// 菜单栏图标，16×16pt：圆角方块减去 K，K 的地方是空的。系统只看不透明度，颜色跟着菜单栏走。
+func menuIcon() -> CGPath {
+    let k = caretK(CGRect(x: 4.6, y: 4.0, width: 7.0, height: 8.0), width: 1.9, gap: 0.9)
+    return squircle(CGRect(x: 0.5, y: 0.5, width: 15, height: 15), radius: 3.3).subtracting(k.stem).subtracting(k.arms)
 }
 
-/// 画一张 pixels 见方的图，图形按 points 见方的坐标来画。
-func render(pixels: Int, points: CGFloat, _ draw: (CGContext, CGFloat) -> Void) -> CGImage {
+/// 画一张 pixels 见方的 App 图标。
+func appIcon(pixels: Int) -> CGImage {
     let ctx = CGContext(data: nil, width: pixels, height: pixels, bitsPerComponent: 8, bytesPerRow: 0, space: srgb,
                         bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
-    let scale = CGFloat(pixels) / points
+    let scale = CGFloat(pixels) / 1024
     ctx.scaleBy(x: scale, y: scale)
-    draw(ctx, scale)
+    drawAppIcon(ctx, scale: scale)
     return ctx.makeImage()!
 }
 
-func write(_ images: [(CGImage, [CFString: Any])], to url: URL, type: UTType) {
-    let destination = CGImageDestinationCreateWithURL(url as CFURL, type.identifier as CFString, images.count, nil)!
-    for (image, properties) in images {
-        CGImageDestinationAddImage(destination, image, properties as CFDictionary)
-    }
+func writePNG(_ image: CGImage, to url: URL) {
+    let destination = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil)!
+    CGImageDestinationAddImage(destination, image, nil)
     guard CGImageDestinationFinalize(destination) else { fatalError("写不出 \(url.path)") }
 }
 
@@ -136,8 +131,7 @@ try FileManager.default.createDirectory(at: iconset, withIntermediateDirectories
 for size in [16, 32, 128, 256, 512] {
     for factor in [1, 2] {
         let name = factor == 1 ? "icon_\(size)x\(size).png" : "icon_\(size)x\(size)@2x.png"
-        let image = render(pixels: size * factor, points: 1024) { drawAppIcon($0, scale: $1) }
-        write([(image, [:])], to: iconset.appendingPathComponent(name), type: .png)
+        writePNG(appIcon(pixels: size * factor), to: iconset.appendingPathComponent(name))
     }
 }
 let icns = resources.appendingPathComponent("AppIcon.icns")
@@ -149,9 +143,13 @@ iconutil.waitUntilExit()
 try? FileManager.default.removeItem(at: iconset)
 guard iconutil.terminationStatus == 0 else { fatalError("iconutil 合成 \(icns.path) 失败") }
 
-// 菜单栏图标：1 倍、2 倍放进同一个 TIFF，系统按屏幕挑
-func dpi(_ value: Int) -> [CFString: Any] { [kCGImagePropertyDPIWidth: value, kCGImagePropertyDPIHeight: value] }
-let tiff = resources.appendingPathComponent("kyme.tiff")
-write([(render(pixels: 16, points: 16) { ctx, _ in drawMenuIcon(ctx) }, dpi(72)),
-       (render(pixels: 32, points: 16) { ctx, _ in drawMenuIcon(ctx) }, dpi(144))], to: tiff, type: .tiff)
-print("已生成 \(icns.path)\n已生成 \(tiff.path)")
+// 菜单栏图标存成矢量 PDF，和微信输入法一样，由系统按实际显示大小现画。
+// 之前用 1 倍、2 倍两张位图拼成的 TIFF，在菜单栏里看着有锯齿
+let pdf = resources.appendingPathComponent("kyme.pdf")
+var page = CGRect(x: 0, y: 0, width: 16, height: 16)
+let context = CGContext(pdf as CFURL, mediaBox: &page, nil)!
+context.beginPDFPage(nil)
+fill(context, menuIcon(), rgb(0))
+context.endPDFPage()
+context.closePDF()
+print("已生成 \(icns.path)\n已生成 \(pdf.path)")

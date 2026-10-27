@@ -94,23 +94,20 @@ fn library_dir() -> Option<PathBuf> {
     std::env::home_dir().map(|home| home.join("Library"))
 }
 
-/// 读 `dir` 下全部 `.dict.yaml`，按文件名排序。
+/// 读安装包 dict/ 下的词库和 emoji 对照表。读不了就用空词库，输入法照样起得来。
 fn load_engine(dir: Option<&Path>) -> Engine {
     let started = Instant::now();
-    let mut paths: Vec<PathBuf> = dir
-        .and_then(|dir| std::fs::read_dir(dir).ok())
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| Some(entry.ok()?.path()))
-        .filter(|path| path.to_string_lossy().ends_with(".dict.yaml"))
-        .collect();
-    paths.sort();
-    let dict = Dictionary::load_rime(&paths).unwrap_or_else(|err| {
-        log::error!("{err}");
-        Dictionary::from_rime_sources(&[])
-    });
-    log::info!("词库 {} 条（{} 个文件），载入耗时 {:?}", dict.len(), paths.len(), started.elapsed());
-    Engine::new(dict)
+    let engine = match dir.map(Engine::load_dir) {
+        Some(Ok(engine)) => engine,
+        Some(Err(err)) => {
+            log::error!("{err}");
+            Engine::new(Dictionary::from_rime_sources(&[]))
+        }
+        None => Engine::new(Dictionary::from_rime_sources(&[])),
+    };
+    let (entries, emoji) = (engine.dictionary().len(), engine.emoji().len());
+    log::info!("词库 {entries} 条，{emoji} 个词带 emoji，载入耗时 {:?}", started.elapsed());
+    engine
 }
 
 fn start_server() -> Option<Retained<IMKServer>> {

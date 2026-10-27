@@ -189,7 +189,7 @@ Kyme Settings.app（GPUI）── 方案 · 外观 · 词库导入 · 模型 · 
 ### Phase 2 · AI 原生 v1（4–6 周）
 
 - kyme-brain 进程 + llama.cpp + 模型下载与管理
-- Rust 拼音 lattice + **✨ 上下文感知组句**
+- Rust 拼音 lattice + **✨ 上下文感知组句**（要解决的用例在 `eval/pending.tsv`，比如 `haonanhe` 该出「好难喝」）
 - **指令模式、选中改写、翻译输入、问 AI**；provider 支持本地、OpenAI 兼容、Anthropic
 - 隐私控制面板：按 App 的规则、无痕模式、☁️ 标识
 

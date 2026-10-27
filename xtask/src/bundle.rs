@@ -149,12 +149,13 @@ fn check_strings(resources: &Path, problems: &mut Vec<String>) {
     }
 }
 
-/// 安装包里的词库要和 data/rime-ice/ 下的一致（文件名和大小）。返回文件个数。
+/// 安装包里的 dict/ 要和 data/rime-ice/ 一模一样（文件名和大小）。返回文件个数。
+/// 隐藏文件不算：build-app.sh 的 `cp data/rime-ice/*` 不拷它们，Finder 又会往文件夹里放 .DS_Store。
 fn check_dict(root: &Path, bundled: &Path, problems: &mut Vec<String>) -> usize {
     let source = dict_files(&root.join("data/rime-ice"));
     let bundled = dict_files(bundled);
     if bundled.is_empty() {
-        problems.push("安装包里没有词库（Resources/dict/*.dict.yaml）".into());
+        problems.push("安装包里没有词库（Resources/dict/）".into());
     } else if bundled != source {
         problems.push(format!("安装包里的词库 {bundled:?} 和 data/rime-ice/ 的 {source:?} 不一致"));
     }
@@ -166,10 +167,7 @@ fn dict_files(dir: &Path) -> BTreeMap<String, u64> {
         .into_iter()
         .flatten()
         .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let name = entry.file_name().into_string().ok()?;
-            name.ends_with(".dict.yaml").then_some(())?;
-            Some((name, entry.metadata().ok()?.len()))
-        })
+        .filter_map(|entry| Some((entry.file_name().into_string().ok()?, entry.metadata().ok()?.len())))
+        .filter(|(name, _)| !name.starts_with('.'))
         .collect()
 }

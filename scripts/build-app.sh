@@ -15,8 +15,8 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/dict"
 cp target/release/kyme-macos "$APP/Contents/MacOS/Kyme"
 cp crates/kyme-macos/bundle/Info.plist "$APP/Contents/"
 cp -R crates/kyme-macos/bundle/Resources/. "$APP/Contents/Resources/"
-# 词库清单只在 fetch-dict.sh 里维护，输入法启动时会读 dict/ 下的全部 .dict.yaml
-cp data/rime-ice/*.dict.yaml "$APP/Contents/Resources/dict/"
+# 数据文件的清单只在 fetch-dict.sh 里维护，这里整个目录照搬（COMMIT 记着是哪个版本）
+cp data/rime-ice/* "$APP/Contents/Resources/dict/"
 # 许可证全文随包发布；还没有 LICENSE 时 cargo xtask qa --release 会报出来
 if [[ -f LICENSE ]]; then
   cp LICENSE "$APP/Contents/Resources/"

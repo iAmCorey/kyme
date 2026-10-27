@@ -10,13 +10,14 @@
 #
 # 场景按顺序在同一个会话里跑，和真实输入法一样会延续状态（比如引号的左右要成对）。
 # 每个场景开始前清空输入框，结束后按一次 Esc，最后要回到中文状态。
-# 期望不能依赖设置（每页候选数、内嵌拼音）。
+# 两边都按默认设置跑，不读你自己的 settings.toml，期望照默认设置写。
 # 用户报的 bug，先在这里加一条能复现的场景，再去修。
 
 空格上屏整句	nihaoshijie{space}	你好世界
 长句	woshizhongguoren{space}	我是中国人
 超过 6 个音节的词	zhonghuarenmingongheguo{space}	中华人民共和国
 数字键选词	nihao1	你好
+emoji 跟在对得上的词后面	haha2	😄
 连续两次上屏	nihao{space}shijie{space}	你好世界
 回车上屏字母，不换行	nihao{enter}	nihao
 Esc 取消输入	nihao{esc}	

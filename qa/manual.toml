@@ -60,7 +60,7 @@ expect = "下方放不下时候选窗翻到输入行上方、不超出屏幕；�
 [[check]]
 app = "浅色 / 深色模式"
 steps = "分别在浅色和深色模式下输入 nihao"
-expect = "候选窗文字清楚；菜单栏的 Kyme 图标在两种模式下都看得清"
+expect = "候选窗文字清楚；菜单栏的 Kyme 图标在两种模式下都看得清，边缘平滑没有锯齿（内置屏和外接屏都看一下）"
 
 [[check]]
 app = "中英切换提示"
@@ -69,5 +69,5 @@ expect = "光标旁依次短暂显示「英」「中」，约 0.7 秒后消失�
 
 [[check]]
 app = "设置"
-steps = "把 ~/Library/Application Support/Kyme/settings.toml 改成 page_size = 3、highlight_color = \"#07C160\"，保存后切换一下输入框再输入"
-expect = "候选变成每页 3 个，高亮变成绿色；改回去后恢复"
+steps = "把 ~/Library/Application Support/Kyme/settings.toml 改成 page_size = 10、highlight_color = \"#07C160\"，保存后切换一下输入框，输入 ni 再按 0"
+expect = "候选变成每页 10 个，序号是 1–9 和 0，按 0 选中第 10 个；高亮变成绿色；改回去后恢复"

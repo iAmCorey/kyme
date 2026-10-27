@@ -5,12 +5,14 @@ use gpui::{
     Context, Div, Hsla, Pixels, Render, SharedString, Size, TextRun, Window, WindowAppearance, div, font, px, rgb,
     rgba, size,
 };
-use kyme_core::{AppearanceSettings, Mode, Panel, Rgb};
+use kyme_core::{AppearanceSettings, Mode, Panel, Rgb, SELECT_KEYS};
 
-/// 其余尺寸都按 18pt 的候选字号设计，换字号时等比缩放。
-const BASE_FONT_SIZE: f32 = 18.0;
-/// 测量误差和边框留的余量，避免文字被挤到换行。
+/// 其余尺寸都按 15pt 的候选字号设计，换字号时等比缩放。
+const BASE_FONT_SIZE: f32 = 15.0;
+/// 测量误差留的余量，避免文字被挤到换行。
 const SLACK: f32 = 4.0;
+/// 窗口边框的粗细，和 `border_1()` 一致。
+const BORDER: f32 = 1.0;
 
 /// 候选窗里显示什么。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,7 +58,7 @@ impl CandidateView {
         let width_of = |text: &str, font_size: f32| text_width(window, &family, text, font_size);
         match &self.content {
             Content::Mode(mode) => {
-                let width = width_of(mode_label(*mode), m.hint) + m.pad_x * 2.0 + SLACK;
+                let width = width_of(mode_label(*mode), m.hint) + m.pad * 2.0 + SLACK;
                 size(px(width.max(m.hint_height).ceil()), px(m.hint_height.ceil()))
             }
             Content::Candidates(panel) => {
@@ -66,7 +68,7 @@ impl CandidateView {
                         row += m.cell_gap;
                     }
                     row += m.cell_pad_x * 2.0
-                        + width_of(&(i + 1).to_string(), m.index)
+                        + width_of(key_label(i), m.index)
                         + m.index_gap
                         + width_of(text, m.candidate);
                 }
@@ -74,10 +76,10 @@ impl CandidateView {
                     row += m.pager;
                 }
                 let preedit = width_of(&panel.preedit, m.preedit);
-                let width = row.max(preedit).max(m.min_width) + m.pad_x * 2.0 + SLACK;
+                let width = row.max(preedit).max(m.min_width) + (m.pad + BORDER) * 2.0 + SLACK;
                 // 拼音显示在输入框里时，候选窗没有拼音那一行
                 let preedit_row = if panel.preedit.is_empty() { 0.0 } else { m.preedit_line + m.row_gap };
-                let height = m.pad_y * 2.0 + preedit_row + m.row;
+                let height = (m.pad + BORDER) * 2.0 + preedit_row + m.row;
                 size(px(width.ceil()), px(height.ceil()))
             }
         }
@@ -91,20 +93,27 @@ fn mode_label(mode: Mode) -> &'static str {
     }
 }
 
+/// 候选前面的序号，也就是选它要按的键。每页最多 `SELECT_KEYS.len()` 个候选。
+fn key_label(index: usize) -> &'static str {
+    &SELECT_KEYS[index..=index]
+}
+
 /// 按字号算出的各种尺寸。
 struct Metrics {
     candidate: f32,
     index: f32,
     preedit: f32,
     preedit_line: f32,
+    /// 一行候选的高度，也是高亮块的高度。
     row: f32,
-    pad_x: f32,
-    pad_y: f32,
+    /// 高亮块离窗口内沿（边框里面）的距离，上下左右一样。
+    pad: f32,
     row_gap: f32,
     cell_pad_x: f32,
     cell_gap: f32,
     index_gap: f32,
     pager: f32,
+    /// 窗口的圆角，比高亮块的圆角大出留白和边框，两个圆角就是同心的。
     radius: f32,
     cell_radius: f32,
     min_width: f32,
@@ -115,24 +124,24 @@ struct Metrics {
 impl Metrics {
     fn new(font_size: f32) -> Self {
         let s = font_size / BASE_FONT_SIZE;
+        let (pad, cell_radius) = (4.0 * s, 5.0 * s);
         Metrics {
             candidate: font_size,
-            index: 12.0 * s,
-            preedit: 13.0 * s,
-            preedit_line: 18.0 * s,
-            row: 30.0 * s,
-            pad_x: 10.0 * s,
-            pad_y: 7.0 * s,
-            row_gap: 4.0 * s,
-            cell_pad_x: 7.0 * s,
+            index: 11.0 * s,
+            preedit: 12.0 * s,
+            preedit_line: 16.0 * s,
+            row: 24.0 * s,
+            pad,
+            row_gap: 3.0 * s,
+            cell_pad_x: 6.0 * s,
             cell_gap: 2.0 * s,
-            index_gap: 4.0 * s,
-            pager: 30.0 * s,
-            radius: 10.0 * s,
-            cell_radius: 6.0 * s,
-            min_width: 120.0 * s,
-            hint: 16.0 * s,
-            hint_height: 36.0 * s,
+            index_gap: 3.0 * s,
+            pager: 26.0 * s,
+            radius: cell_radius + pad + BORDER,
+            cell_radius,
+            min_width: 100.0 * s,
+            hint: 14.0 * s,
+            hint_height: 30.0 * s,
         }
     }
 }
@@ -227,8 +236,7 @@ impl Render for CandidateView {
             Content::Candidates(panel) => root
                 .flex()
                 .flex_col()
-                .px(px(m.pad_x))
-                .py(px(m.pad_y))
+                .p(px(m.pad))
                 .gap(px(m.row_gap))
                 .when(!panel.preedit.is_empty(), |root| {
                     root.child(
@@ -268,7 +276,7 @@ fn candidate_cell(theme: &Theme, m: &Metrics, index: usize, text: &str, selected
     let (index_color, text_color) =
         if selected { (theme.on_accent_muted, theme.on_accent) } else { (theme.secondary, theme.primary) };
     div()
-        .h(px(m.row - 2.0))
+        .h(px(m.row))
         .flex()
         .flex_row()
         .items_center()
@@ -277,7 +285,7 @@ fn candidate_cell(theme: &Theme, m: &Metrics, index: usize, text: &str, selected
         .rounded(px(m.cell_radius))
         .whitespace_nowrap()
         .when(selected, |cell| cell.bg(theme.accent))
-        .child(div().text_size(px(m.index)).text_color(index_color).child((index + 1).to_string()))
+        .child(div().text_size(px(m.index)).text_color(index_color).child(key_label(index)))
         .child(div().text_size(px(m.candidate)).text_color(text_color).child(text.to_string()))
 }
 

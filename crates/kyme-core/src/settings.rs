@@ -7,6 +7,8 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Deserializer, de};
 
+use crate::session::SELECT_KEYS;
+
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -17,16 +19,18 @@ pub struct Settings {
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct InputSettings {
-    /// 每页候选个数，1–9。
+    /// 每页候选个数，5–10。第 10 个用 0 键选。
     pub page_size: usize,
     /// 输入时拼音显示在输入框里（默认），候选窗只有一行候选。关掉的话拼音显示在候选窗第一行，
     /// 输入框里只有选定的字（还没选时是一个占位）。
     pub inline_pinyin: bool,
+    /// 和整串拼音对得上的词后面，候选里跟上它的 emoji。
+    pub emoji: bool,
 }
 
 impl Default for InputSettings {
     fn default() -> Self {
-        InputSettings { page_size: 5, inline_pinyin: true }
+        InputSettings { page_size: 7, inline_pinyin: true, emoji: true }
     }
 }
 
@@ -43,7 +47,7 @@ pub struct AppearanceSettings {
 
 impl Default for AppearanceSettings {
     fn default() -> Self {
-        AppearanceSettings { font_size: 18.0, font_family: String::new(), highlight_color: Rgb(0x5e5ce6) }
+        AppearanceSettings { font_size: 15.0, font_family: String::new(), highlight_color: Rgb(0x5e5ce6) }
     }
 }
 
@@ -67,7 +71,7 @@ impl Settings {
 
     /// 把超出范围的值收拢到合法范围。
     pub fn normalized(mut self) -> Self {
-        self.input.page_size = self.input.page_size.clamp(1, 9);
+        self.input.page_size = self.input.page_size.clamp(5, SELECT_KEYS.len());
         let font_size = self.appearance.font_size;
         self.appearance.font_size =
             if font_size.is_finite() { font_size.clamp(12.0, 36.0) } else { AppearanceSettings::default().font_size };
@@ -79,14 +83,16 @@ impl Settings {
 pub const SETTINGS_TEMPLATE: &str = r##"# Kyme 设置。改完保存，切换一下输入框就会生效。
 
 [input]
-# 每页候选个数（1–9）
-page_size = 5
+# 每页候选个数（5–10），第 10 个用 0 键选
+page_size = 7
 # 输入时拼音显示在输入框里，候选窗只有一行候选。false：拼音显示在候选窗第一行
 inline_pinyin = true
+# 候选里带 emoji：和打的拼音对得上的词后面跟着它的 emoji
+emoji = true
 
 [appearance]
 # 候选字号（pt，12–36），其余文字和间距按比例缩放
-font_size = 18
+font_size = 15
 # 候选窗字体，留空用系统默认的中文字体
 font_family = ""
 # 选中候选的高亮颜色（#RRGGBB）
@@ -151,15 +157,15 @@ mod tests {
     fn missing_keys_use_defaults() {
         assert_eq!(Settings::from_toml("").unwrap(), Settings::default());
         let settings = Settings::from_toml("[input]\ninline_pinyin = false").unwrap();
-        assert!(!settings.input.inline_pinyin);
-        assert_eq!(settings.input.page_size, 5);
+        assert_eq!(settings.input, InputSettings { inline_pinyin: false, ..InputSettings::default() });
     }
 
     #[test]
     fn values_are_clamped() {
         let settings = Settings::from_toml("[input]\npage_size = 20\n[appearance]\nfont_size = 4").unwrap();
-        assert_eq!(settings.input.page_size, 9);
+        assert_eq!(settings.input.page_size, 10);
         assert_eq!(settings.appearance.font_size, 12.0);
+        assert_eq!(Settings::from_toml("[input]\npage_size = 3").unwrap().input.page_size, 5);
     }
 
     #[test]
@@ -184,8 +190,8 @@ mod tests {
 
         // 修改时间要和上次不同才算改过
         std::thread::sleep(Duration::from_millis(20));
-        fs::write(&path, "[input]\npage_size = 3\n").unwrap();
-        assert_eq!(file.reload().unwrap().unwrap().input.page_size, 3);
+        fs::write(&path, "[input]\npage_size = 6\n").unwrap();
+        assert_eq!(file.reload().unwrap().unwrap().input.page_size, 6);
 
         std::thread::sleep(Duration::from_millis(20));
         fs::write(&path, "[input]\npage_size = \"many\"\n").unwrap();
