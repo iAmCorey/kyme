@@ -1,8 +1,8 @@
 //! `Kyme --qa`：自测模式，给 `cargo xtask qa` 用。
 //!
 //! 启动真正的输入会话、macOS 接入代码和候选窗，但不连系统的输入法服务（IMK），而是换上一个假的输入框：
-//! 从标准输入一行行读按键（JSON），合成 NSEvent 交给 [`state::handle_event`]，再把这个键接没接、
-//! 假输入框里上屏和正在输入的文字、候选窗的位置写回标准输出。不切输入法，不抢焦点，不写日志。
+//! 从标准输入一行行读按键（JSON），合成 NSEvent 交给 [`state::handle_event`]；鼠标点候选窗交给 [`state::pick`]。
+//! 再把这个键接没接、假输入框里上屏和正在输入的文字、候选窗的位置写回标准输出。不切输入法，不抢焦点，不写日志。
 //!
 //! 为什么不在真的 App 里模拟打字：程序合成的字母键经系统转给输入法时，输入法收到的是控制字符，
 //! 认不出是哪个字母（真实键盘没有这个问题）。各个 App 里的表现交给人工检查清单。
@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use dispatch2::DispatchQueue;
 use gpui::Application;
-use kyme_core::SettingsFile;
+use kyme_core::{Pick, SettingsFile};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
@@ -31,6 +31,8 @@ use crate::state;
 enum Request {
     /// 合成一个按键事件交给输入会话，参数的含义见 xtask/src/scenario.rs 的 Press。
     Key { flags_changed: bool, code: u16, chars: String, shift: bool, command: bool },
+    /// 鼠标点了候选窗：走候选窗点击之后的那条路（不经过 GPUI 的命中检测）。
+    Click { pick: Pick },
     /// 清空假输入框。
     Clear,
     /// 只读状态。
@@ -159,6 +161,7 @@ fn execute(mtm: MainThreadMarker, request: Request) -> Result<Reply, String> {
                 handled = state::handle_event(&event, client);
                 elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
             }
+            Request::Click { pick } => state::pick(pick),
             Request::Clear => {
                 ivars.inserted.borrow_mut().clear();
                 ivars.marked.borrow_mut().clear();

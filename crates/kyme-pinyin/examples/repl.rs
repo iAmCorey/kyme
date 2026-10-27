@@ -30,6 +30,12 @@ fn main() {
         let conversion = engine.convert(input);
         let elapsed = started.elapsed();
         let top: Vec<&str> = conversion.candidates.iter().take(6).map(|c| c.text.as_str()).collect();
-        writeln!(stdout, "{:<28} {:>9.2?}  {}", conversion.preedit, elapsed, top.join(" ")).ok();
+        // 用了纠错时，打的字母后面再跟上引擎理解成的拼写
+        let pinyin = if conversion.spelling == conversion.preedit {
+            conversion.preedit.clone()
+        } else {
+            format!("{} → {}", conversion.preedit, conversion.spelling)
+        };
+        writeln!(stdout, "{pinyin:<28} {elapsed:>9.2?}  {}", top.join(" ")).ok();
     }
 }

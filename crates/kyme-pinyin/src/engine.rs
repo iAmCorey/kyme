@@ -36,7 +36,7 @@ const DOUBLED_ACROSS_PENALTY: f64 = 2.0;
 /// 太小会改掉打对了的输入（naan 是「那按」，读成 nan「难」只好 5.3；打到一半的 naann 好 6.0）；
 /// 太大会纠不回明显的手误（xiaang 读成 xiang「想」比照着打的 xia'ang「下昂」好 10.6）。
 /// 最后一个音节没打完时也用这个值：打到一半是每按一个键都有的状态，比最后一下按错常见得多，
-/// 从宽会让拼音在打字过程中跳来跳去（打到 lain 显示成 lian，再打一个 a 又变回 lai'na）。
+/// 从宽会让首选在打字过程中跳来跳去（打到 lain 读成 lian，再打一个 a 又变回 lai'na）。
 const TYPO_MARGIN: f64 = 7.0;
 /// 拼音里的元音字母。一个元音都没有的输入是在打简拼（rgzn），不做纠错。
 const VOWELS: &[u8] = b"aeiouv";
@@ -78,7 +78,7 @@ struct Seg {
     end: usize,
     constraint: Constraint,
     penalty: f64,
-    /// 纠错得来的音节，预编辑里显示纠正后的拼写。
+    /// 纠错得来的音节：spelling 里写纠正后的拼写，preedit 照样显示打的字母。
     fixed: Option<SylId>,
 }
 
@@ -271,8 +271,12 @@ pub struct Candidate {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Conversion {
-    /// 按最优切分加了分隔符的拼音，例如 `ni'hao`。
+    /// 显示给用户的拼音：就是打的字母，按最优切分加了分隔符，例如 `ni'hao`。
+    /// 纠过错的词照原样显示，中间不加分隔符（打 `zhnog` 显示 `zhnog`）。
     pub preedit: String,
+    /// 引擎理解的拼音：纠过错的音节换成纠正后的拼写（打 `zhnog` 是 `zhong`）。
+    /// 字母和 preedit 不一样，就说明首选用了纠错。
+    pub spelling: String,
     pub candidates: Vec<Candidate>,
 }
 
@@ -343,7 +347,7 @@ impl Engine {
         }
         let mut plain = self.solve(input, Reading::Plain).conversion;
         // 照着打的读法以没打完的音节结尾、纠错改的又正是它：分不清是还没打完还是最后一下按错了
-        // （suho 可能要接着打 suhong，也可能是想打「说」）。拼音照着打的显示，纠错的整句排第二，按 2 就能选
+        // （suho 可能要接着打 suhong，也可能是想打「说」）。首选按照着打的读法，纠错的整句排第二，按 2 就能选
         let at_tail = matches!((literal.unfinished_from, best.last_fix_end), (Some(tail), Some(end)) if end > tail);
         if at_tail
             && let Some(fixed) = best.conversion.candidates.into_iter().next()
@@ -398,11 +402,12 @@ impl Engine {
         }
         steps.reverse();
 
-        // 沿最优路径拼出整句，同时给拼音加分隔符：纠过错的音节显示纠正后的拼写，
-        // 用户自己打的分隔符原样保留
+        // 沿最优路径拼出整句和两份拼音：preedit 显示打的字母，spelling 换成纠正后的拼写。
+        // 两份都在音节之间加分隔符，用户自己打的分隔符原样保留
         let table = self.dict.table();
         let mut sentence = String::new();
         let mut preedit = String::with_capacity(n + 8);
+        let mut spelling = String::with_capacity(n + 8);
         let mut after_syllable = false;
         let mut boundaries = HashSet::new();
         let mut sentence_corrected = false;
@@ -413,20 +418,23 @@ impl Engine {
             match step {
                 Step::Word { entry, segs } => {
                     sentence.push_str(self.dict.text(*entry));
+                    // 纠过错的词整个照原样显示：纠正可能挪动了字母（nhiao 是 ni'hao），按音节切开反而对不上
+                    let fixed_word = segs.iter().any(|seg| seg.fixed.is_some());
+                    sentence_corrected |= fixed_word;
+                    if fixed_word {
+                        push_part(&mut preedit, after_syllable, &input[*start..*end]);
+                    }
                     for seg in segs {
                         boundaries.insert(seg.end);
-                        sentence_corrected |= seg.fixed.is_some();
                         if seg.fixed.is_some() {
                             last_fix_end = Some(seg.end);
                         }
                         let unfinished = seg.end == n && matches!(seg.constraint, Constraint::Prefix { .. });
                         unfinished_from = unfinished.then_some(seg.start);
-                        if after_syllable {
-                            preedit.push('\'');
-                        }
-                        match seg.fixed {
-                            Some(id) => preedit.push_str(table.name(id)),
-                            None => preedit.push_str(&input[seg.start..seg.end]),
+                        let typed = &input[seg.start..seg.end];
+                        push_part(&mut spelling, after_syllable, seg.fixed.map_or(typed, |id| table.name(id)));
+                        if !fixed_word {
+                            push_part(&mut preedit, after_syllable, typed);
                         }
                         after_syllable = true;
                     }
@@ -434,14 +442,13 @@ impl Engine {
                 Step::Raw => {
                     let raw = &input[*start..*end];
                     sentence.push_str(raw);
-                    if after_syllable {
-                        preedit.push('\'');
-                    }
-                    preedit.push_str(raw);
+                    push_part(&mut preedit, after_syllable, raw);
+                    push_part(&mut spelling, after_syllable, raw);
                     after_syllable = false;
                 }
                 Step::Separator => {
                     preedit.push('\'');
+                    spelling.push('\'');
                     after_syllable = false;
                 }
             }
@@ -479,7 +486,7 @@ impl Engine {
             corrected: sentence_corrected,
             last_fix_end,
             unfinished_from,
-            conversion: Conversion { preedit, candidates },
+            conversion: Conversion { preedit, spelling, candidates },
         }
     }
 
@@ -638,6 +645,14 @@ impl Engine {
     }
 }
 
+/// 接上一段拼音：前面已经是音节的话，先加一个分隔符。
+fn push_part(pinyin: &mut String, after_syllable: bool, part: &str) {
+    if after_syllable {
+        pinyin.push('\'');
+    }
+    pinyin.push_str(part);
+}
+
 fn relax(
     cost: &mut [f64],
     back: &mut [Option<(usize, Step)>],
@@ -743,10 +758,12 @@ mod tests {
     fn swapped_letters_are_corrected() {
         let c = engine().convert("zhnog");
         assert_eq!(c.candidates[0].text, "中");
-        assert_eq!(c.preedit, "zhong", "预编辑显示纠正后的拼写");
+        assert_eq!(c.preedit, "zhnog", "显示的是打的字母");
+        assert_eq!(c.spelling, "zhong", "引擎理解成纠正后的拼写");
         let c = engine().convert("nihoa");
         assert_eq!(c.candidates[0].text, "你好");
-        assert_eq!(c.preedit, "ni'hao");
+        assert_eq!(c.preedit, "nihoa", "纠过错的词照原样显示，中间不加分隔符");
+        assert_eq!(c.spelling, "ni'hao");
         assert_eq!(engine().convert("xinag").candidates[0].text, "想");
     }
 
@@ -758,25 +775,26 @@ mod tests {
         assert_eq!(e.convert("nihhao").candidates[0].text, "你好", "连按两次");
         let c = e.convert("nhiao");
         assert_eq!(c.candidates[0].text, "你好", "跨音节打反");
-        assert_eq!(c.preedit, "ni'hao");
+        assert_eq!(c.preedit, "nhiao");
+        assert_eq!(c.spelling, "ni'hao");
     }
 
     #[test]
     fn doubled_letters_on_a_syllable_boundary_are_kept() {
         // naan 是 na'an，不是 nan 多按了一个 a；不然 naanni 会被吃掉一个 a 变成「南宁」
         let c = engine().convert("naan");
-        assert_eq!(c.preedit, "na'an");
+        assert_eq!(c.spelling, "na'an");
         assert_eq!(c.candidates[0].text, "那按");
         let c = engine().convert("naanni");
-        assert_eq!(c.preedit, "na'an'ni");
+        assert_eq!(c.spelling, "na'an'ni");
         assert_eq!(c.candidates[0].text, "那按你");
     }
 
     #[test]
     fn unfinished_tail_keeps_typed_letters_and_offers_the_fix_second() {
-        // suho 可能要接着打 suhong，也可能是「说」打反了：拼音照着打的显示，「说」排第二
+        // suho 可能要接着打 suhong，也可能是「说」打反了：首选按照着打的读法，「说」排第二
         let c = engine().convert("suho");
-        assert_eq!(c.preedit, "su'ho");
+        assert_eq!(c.spelling, "su'ho");
         assert_eq!(texts(&c)[1], "说");
     }
 

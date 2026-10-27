@@ -6,6 +6,7 @@
 #   {space} {enter} {bs} {esc} {left} {right} {up} {down} {pgup} {pgdn}
 #   {shift} 轻点 Shift，{shift-down} {shift-up} 分开按下和松开，{wait:500} 停 500 毫秒
 #   {cmd+c} 这类快捷键（别用会改文字的，比如 cmd+a、cmd+v），{{ 是字面的 {
+#   {click:2} 鼠标点本页第 2 个候选，{click:prev} {click:next} 点翻页箭头
 # 方向键只能在输入中用：模拟的输入框不移动光标。
 #
 # 场景按顺序在同一个会话里跑，和真实输入法一样会延续状态（比如引号的左右要成对）。
@@ -17,7 +18,7 @@
 长句	woshizhongguoren{space}	我是中国人
 超过 6 个音节的词	zhonghuarenmingongheguo{space}	中华人民共和国
 数字键选词	nihao1	你好
-emoji 跟在对得上的词后面	haha2	😄
+emoji 放在第一页最后一格	haha7	😄
 连续两次上屏	nihao{space}shijie{space}	你好世界
 回车上屏字母，不换行	nihao{enter}	nihao
 Esc 取消输入	nihao{esc}	
@@ -30,6 +31,9 @@ Esc 取消输入	nihao{esc}
 两个相同元音能切成两个音节时不当成多按了一下	naanni{space}	那按你
 翻页再翻回	ni{pgdn}{pgup}{space}	你
 等号减号翻页	ni=-{space}	你
+鼠标点候选上屏	nihao{click:1}	你好
+鼠标点了一部分，接着点剩下的	nihao{click:3}{click:1}	你好
+鼠标点箭头翻页再翻回，再点候选	ni{click:next}{click:prev}{click:1}	你
 左右移动高亮	ni{right}{left}{space}	你
 输入中方向键不影响已上屏的字	nihao{space}ni{right}{left}{space}	你好你
 输入中按标点：首选上屏再接中文标点	nihao,	你好，

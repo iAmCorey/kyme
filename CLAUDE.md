@@ -26,6 +26,8 @@ cargo run --release -p kyme-pinyin --example repl -- data/rime-ice/8105.dict.yam
 
 一次按键的路径：IMK → `kyme-macos/controller.rs` → `state::handle_event` → `kyme_core::Session::handle_key` → `Response`（接没接、上屏的文字、`View`）。之后 `client.rs` 调 `insertText` / `setMarkedText`，`panel.rs` 用 `kyme-ui` 画候选窗，贴到光标旁边。光标位置每个键都重新问 App。
 
+鼠标点候选窗的路径：`kyme-ui` 等 GPUI 处理完这次鼠标事件再回调 → `state::pick` → `Session::pick`（选字键和翻页键也走它），结果交给最近一次按键所在的输入框。
+
 - **`kyme-pinyin`**：引擎。负责音节切分（含简拼和没打完的末尾音节），按一元词频在词图上做 Viterbi 组句，再做手误纠错。另外带一张 emoji 对照表。`Engine::load_dir` 读整个数据目录（`*.dict.yaml` 和 `emoji.txt`），输入法和 xtask 都用它。
 - **`kyme-core`**：和平台无关的输入会话，包括候选、翻页、中英切换、标点、emoji 插入，还有设置文件。
   - 设置文件在 `~/Library/Application Support/Kyme/settings.toml`，每次切到一个输入框时检查有没有改过。`SETTINGS_TEMPLATE` 必须等于默认值，有测试守着。
@@ -39,8 +41,9 @@ cargo run --release -p kyme-pinyin --example repl -- data/rime-ice/8105.dict.yam
 照着打对的拼音永远不能被改。为什么这样设计见 `docs/ENGINE.md`。
 
 - **什么时候用纠错结果**：纠错后的整句要比「照着打」的读法（只用完整音节）好出 `TYPO_MARGIN`，才会被采用。
-- **改动落在没打完的末尾音节时**：拼音照打的显示，纠错结果排第二个候选。
-- **评测怎么守**：一是把 `eval/pinyin.tsv` 里「本来就对」的用例逐个前缀打一遍，拼音都不能变；二是把常用音节两两拼接，检查被改的比例不超过门槛。
+- **改动落在没打完的末尾音节时**：首选按照着打的读法，纠错结果排第二个候选。
+- **显示和理解分开**：输入框里显示的永远是打的字母（`Conversion.preedit`），引擎理解成什么在 `spelling` 里。下面说的「被改」都是指 `spelling` 和打的字母不一样。
+- **评测怎么守**：一是把 `eval/pinyin.tsv` 的用例逐个前缀打一遍，`preedit` 都得是打的字母，「本来就对」的那些 `spelling` 也不能变；二是把常用音节两两拼接，检查被改的比例不超过门槛。
 - **还做不到的用例**：放进 `eval/pending.tsv`，只报告，不卡发版。
 
 ## 测试和调试时要注意

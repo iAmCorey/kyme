@@ -76,7 +76,7 @@ fn boot(cx: &mut App, loading: JoinHandle<Engine>, settings: SettingsFile) {
     // GPUI 启动时把激活策略设成 Regular（会出现 Dock 图标），输入法要改回来
     let _ = NSApplication::sharedApplication(mtm).setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
-    let panel = panel::PanelWindow::open(cx);
+    let panel = panel::PanelWindow::open(cx, state::pick);
     let engine = Arc::new(loading.join().expect("读词库的线程崩溃了"));
     // 构建词库时的临时内存是在另一个线程分配的，释放后 malloc 不会主动还给系统
     // SAFETY: 传 NULL 表示处理全部 malloc zone，0 表示尽量多还

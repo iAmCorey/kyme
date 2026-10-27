@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use kyme_core::{Session, View};
+use kyme_core::{Pick, Session, View};
 use serde::{Deserialize, Serialize};
 
 use crate::report::Outcome;
@@ -31,6 +31,7 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 #[serde(tag = "cmd", rename_all = "snake_case")]
 enum Request {
     Key { flags_changed: bool, code: u16, chars: String, shift: bool, command: bool },
+    Click { pick: Pick },
     Clear,
     State,
 }
@@ -113,28 +114,36 @@ fn play(
     let mut mismatch = None;
     let mut step = 0;
     for stroke in &scenario.strokes {
-        let press = match stroke {
+        // 这一步之后自测进程的状态、参照会话的回应、应不应该算「输入法接住了」、写进报告的名字
+        let (state, response, handled, label) = match stroke {
             // 自测进程收到下一个键时才看时间，这里照常等
             Stroke::Wait(duration) => {
                 thread::sleep(*duration);
                 continue;
             }
-            Stroke::Press(press) => press,
+            Stroke::Press(press) => {
+                let state = kyme.request(&key(press))?;
+                timings.push(Duration::from_micros(state.elapsed_us));
+                let response = oracle.handle_key(press.key, press.mods);
+                // 修饰键的变化总是交还给 App，和 state.rs 一致
+                let handled = response.handled && !press.flags_changed;
+                (state, response, handled, press.label.as_str())
+            }
+            // 点击不是按键，没有「接没接」
+            Stroke::Click { pick, label } => {
+                let state = kyme.request(&Request::Click { pick: *pick })?;
+                (state, oracle.pick(*pick), false, label.as_str())
+            }
         };
         step += 1;
-        let state = kyme.request(&key(press))?;
-        timings.push(Duration::from_micros(state.elapsed_us));
-        let response = oracle.handle_key(press.key, press.mods);
         if response.mode_changed.is_some() {
             toggled = Some(Instant::now());
         }
         if let Some(text) = &response.commit {
             inserted.push_str(text);
         }
-        // 修饰键的变化总是交还给 App，和 state.rs 一致
-        let handled = response.handled && !press.flags_changed;
         if let Err(problem) = compare(&state, handled, &inserted, oracle) {
-            mismatch = Some(format!("第 {step} 个键 {} 之后：{problem}", press.label));
+            mismatch = Some(format!("第 {step} 步 {label} 之后：{problem}"));
             break;
         }
     }

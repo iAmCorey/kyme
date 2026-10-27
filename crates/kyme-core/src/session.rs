@@ -1,8 +1,8 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kyme_pinyin::{Candidate, Conversion, Engine};
+use serde::{Deserialize, Serialize};
 
 use crate::punct::Punctuation;
 use crate::settings::Settings;
@@ -12,6 +12,16 @@ const SHIFT_TAP: Duration = Duration::from_millis(400);
 
 /// 选候选的键，按顺序对应本页第 1、2…… 个候选。每页最多也就这么多个候选。
 pub const SELECT_KEYS: &str = "1234567890";
+
+/// 鼠标点了候选窗的哪里。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Pick {
+    /// 本页第几个候选，从 0 数。
+    Candidate(usize),
+    PrevPage,
+    NextPage,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -57,6 +67,8 @@ pub struct Panel {
     pub preedit: String,
     pub candidates: Vec<String>,
     pub highlighted: usize,
+    /// 这一页里 emoji 是第几个候选（从 0 数），没有就是 None。候选窗在它前面画一条分隔线。
+    pub emoji: Option<usize>,
     pub has_prev: bool,
     pub has_next: bool,
 }
@@ -96,6 +108,8 @@ pub struct Session {
     input: String,
     pieces: Vec<Piece>,
     conversion: Conversion,
+    /// `conversion.candidates` 里 emoji 那一个的下标。
+    emoji_at: Option<usize>,
     highlight: usize,
     punct: Punctuation,
     after_digit: bool,
@@ -111,6 +125,7 @@ impl Session {
             input: String::new(),
             pieces: Vec::new(),
             conversion: Conversion::default(),
+            emoji_at: None,
             highlight: 0,
             punct: Punctuation::default(),
             after_digit: false,
@@ -161,7 +176,7 @@ impl Session {
             && let Some(slot) = SELECT_KEYS.find(c)
             && slot < self.page_size()
         {
-            return self.select(self.page() * self.page_size() + slot);
+            return self.pick(Pick::Candidate(slot));
         }
         match key {
             Key::Char(c) if c.is_ascii_lowercase() || (composing && c.is_ascii_uppercase()) => {
@@ -178,14 +193,8 @@ impl Session {
             }
             // 本页没有这么多候选：1–9 什么都不做，0 往下按普通字符处理（首选上屏，再接上 0）
             Key::Char('1'..='9') if composing => self.handled(None),
-            Key::Char('-') | Key::Up | Key::PageUp if composing => {
-                self.turn_page(false);
-                self.handled(None)
-            }
-            Key::Char('=') | Key::Down | Key::PageDown if composing => {
-                self.turn_page(true);
-                self.handled(None)
-            }
+            Key::Char('-') | Key::Up | Key::PageUp if composing => self.pick(Pick::PrevPage),
+            Key::Char('=') | Key::Down | Key::PageDown if composing => self.pick(Pick::NextPage),
             // 输入中按别的字符：首选上屏，再接上它。有中文标点的换成中文标点，
             // 没有的（/ @ + 0 等）原样接上，不能吞掉
             Key::Char(c) if composing => {
@@ -239,6 +248,22 @@ impl Session {
         self.is_composing().then(|| self.take_raw())
     }
 
+    /// 选本页的某个候选，或者翻页。鼠标点候选窗时直接调它，选字键和翻页键也走这里，两边的效果一样。
+    /// 不在输入中时什么都不做。
+    pub fn pick(&mut self, pick: Pick) -> Response {
+        if !self.is_composing() {
+            return self.pass();
+        }
+        match pick {
+            Pick::Candidate(slot) if slot < self.page_size() => self.select(self.page() * self.page_size() + slot),
+            Pick::Candidate(_) => self.handled(None),
+            Pick::PrevPage | Pick::NextPage => {
+                self.turn_page(pick == Pick::NextPage);
+                self.handled(None)
+            }
+        }
+    }
+
     pub fn view(&self) -> View {
         if !self.is_composing() {
             return View::Idle;
@@ -264,6 +289,7 @@ impl Session {
                 preedit,
                 candidates,
                 highlighted: self.highlight - start,
+                emoji: self.emoji_at.filter(|at| (start..start + page_size).contains(at)).map(|at| at - start),
                 has_prev: page > 0,
                 has_next: start + page_size < total,
             },
@@ -357,33 +383,30 @@ impl Session {
 
     fn refresh(&mut self) {
         self.conversion = self.engine.convert(&self.input);
-        if self.settings.input.emoji {
-            self.add_emoji();
-        }
+        self.emoji_at = if self.settings.input.emoji { self.add_emoji() } else { None };
         self.highlight = 0;
     }
 
-    /// 和整串拼音对得上的候选后面，跟上它对应的 emoji，选中时一样消耗整串拼音。
-    /// 只消耗了一部分拼音的候选不带，首选永远是字。
-    fn add_emoji(&mut self) {
+    /// 第一页最后一格放一个 emoji，返回它在候选列表里的下标。取第一页里第一个和整串拼音对得上、又有 emoji 的词，
+    /// 用它的第一个 emoji，选中时一样消耗整串拼音。只放这一个、只放在这一格，前面几格永远是字，数字键选字的位置不受影响。
+    fn add_emoji(&mut self) -> Option<usize> {
+        let slot = self.page_size() - 1;
+        let whole = self.input.len();
         let emoji = self.engine.emoji();
-        let mut shown = HashSet::new();
-        let mut candidates = Vec::with_capacity(self.conversion.candidates.len());
-        for candidate in std::mem::take(&mut self.conversion.candidates) {
-            let matched = if candidate.consumed == self.input.len() { emoji.get(&candidate.text) } else { &[] };
-            let consumed = candidate.consumed;
-            candidates.push(candidate);
-            for text in matched.iter().filter(|text| shown.insert(text.as_str())) {
-                candidates.push(Candidate { text: text.clone(), consumed });
-            }
-        }
-        self.conversion.candidates = candidates;
+        let candidates = &self.conversion.candidates;
+        let text =
+            candidates.iter().take(slot).filter(|c| c.consumed == whole).find_map(|c| emoji.get(&c.text).first())?;
+        let candidate = Candidate { text: text.clone(), consumed: whole };
+        let at = slot.min(candidates.len());
+        self.conversion.candidates.insert(at, candidate);
+        Some(at)
     }
 
     fn clear(&mut self) {
         self.input.clear();
         self.pieces.clear();
         self.conversion = Conversion::default();
+        self.emoji_at = None;
         self.highlight = 0;
     }
 
@@ -493,13 +516,15 @@ mod tests {
     }
 
     /// ni 有 11 个候选，每页最多 10 个也翻得了页。词频从高到低：你拟泥尼妮倪霓逆腻溺匿。
-    fn session_with_many_candidates(page_size: usize) -> Session {
+    /// `emoji` 是 emoji 对照表的内容，不要就传空串。
+    fn session_with_many_candidates(page_size: usize, emoji: &str) -> Session {
         let sample: String = "你拟泥尼妮倪霓逆腻溺匿"
             .chars()
             .enumerate()
             .map(|(i, c)| format!("{c}\tni\t{}\n", 1000 - i * 10))
             .collect();
-        let mut s = Session::new(Arc::new(Engine::new(Dictionary::from_rime_sources(&[&sample]))));
+        let engine = Engine::new(Dictionary::from_rime_sources(&[&sample])).with_emoji(Emoji::parse(emoji));
+        let mut s = Session::new(Arc::new(engine));
         let mut settings = Settings::default();
         settings.input.page_size = page_size;
         s.set_settings(settings);
@@ -508,7 +533,7 @@ mod tests {
 
     #[test]
     fn page_size_option() {
-        let mut s = session_with_many_candidates(5);
+        let mut s = session_with_many_candidates(5, "");
         type_str(&mut s, "ni");
         let View::Composing { panel, .. } = s.view() else { panic!() };
         assert_eq!(panel.candidates.len(), 5);
@@ -522,7 +547,7 @@ mod tests {
 
     #[test]
     fn zero_selects_the_tenth_candidate() {
-        let mut s = session_with_many_candidates(10);
+        let mut s = session_with_many_candidates(10, "");
         type_str(&mut s, "ni");
         assert_eq!(press(&mut s, Key::Char('0')).commit.as_deref(), Some("溺"));
 
@@ -533,15 +558,33 @@ mod tests {
     }
 
     #[test]
-    fn emoji_follow_words_matching_the_whole_input() {
+    fn one_emoji_in_the_last_slot_of_the_first_page() {
+        // 满一页时 emoji 占第一页最后一格，原来那格的字挤到第二页；一个词有几个 emoji 也只放第一个
+        let mut s = session_with_many_candidates(5, "你\t你 👉 👈\n妮\t妮 👧\n");
+        type_str(&mut s, "ni");
+        let View::Composing { panel, .. } = s.view() else { panic!() };
+        assert_eq!(panel.candidates, ["你", "拟", "泥", "尼", "👉"]);
+        assert_eq!(panel.emoji, Some(4), "候选窗据此在 emoji 前面画分隔线");
+        press(&mut s, Key::Char('='));
+        let View::Composing { panel, .. } = s.view() else { panic!() };
+        assert_eq!(panel.candidates, ["妮", "倪", "霓", "逆", "腻"], "整个列表只放一个 emoji");
+        assert_eq!(panel.emoji, None);
+        press(&mut s, Key::Char('-'));
+        assert_eq!(press(&mut s, Key::Char('5')).commit.as_deref(), Some("👉"));
+    }
+
+    #[test]
+    fn emoji_only_for_words_matching_the_whole_input() {
         let emoji = Emoji::parse("你好\t你好 👋\n你\t你 👉\n");
         let engine = Engine::new(Dictionary::from_rime_sources(&[SAMPLE])).with_emoji(emoji);
         let mut s = Session::new(Arc::new(engine));
         type_str(&mut s, "nihao");
         let View::Composing { panel, .. } = s.view() else { panic!() };
-        assert_eq!(panel.candidates[..2], ["你好", "👋"]);
+        assert_eq!(panel.candidates.last().map(String::as_str), Some("👋"), "不满一页时放在最后");
+        assert_eq!(panel.emoji, Some(panel.candidates.len() - 1));
         assert!(!panel.candidates.iter().any(|c| c == "👉"), "只消耗了 ni 的「你」不带 emoji");
-        assert_eq!(press(&mut s, Key::Char('2')).commit.as_deref(), Some("👋"), "选 emoji 消耗整串拼音");
+        let key = SELECT_KEYS.chars().nth(panel.candidates.len() - 1).unwrap();
+        assert_eq!(press(&mut s, Key::Char(key)).commit.as_deref(), Some("👋"), "选 emoji 消耗整串拼音");
 
         let mut settings = Settings::default();
         settings.input.emoji = false;
@@ -549,6 +592,28 @@ mod tests {
         type_str(&mut s, "nihao");
         let View::Composing { panel, .. } = s.view() else { panic!() };
         assert!(!panel.candidates.iter().any(|c| c == "👋"), "设置里关掉就不带");
+    }
+
+    #[test]
+    fn clicks_pick_candidates_and_turn_pages() {
+        let mut s = session_with_many_candidates(5, "");
+        type_str(&mut s, "ni");
+        s.pick(Pick::NextPage);
+        let View::Composing { panel, .. } = s.view() else { panic!() };
+        assert!(panel.has_prev, "点 › 翻到了第二页");
+        assert_eq!(s.pick(Pick::Candidate(1)).commit.as_deref(), Some("霓"), "第二页的第 2 个");
+        assert_eq!(s.pick(Pick::Candidate(0)).commit, None, "不在输入中，点了也不算");
+    }
+
+    #[test]
+    fn marked_text_is_what_was_typed() {
+        // nihoa 会纠成「你好」，但输入框里显示的、回车上屏的都是打的字母
+        let mut s = session();
+        type_str(&mut s, "nihoa");
+        let View::Composing { marked, panel } = s.view() else { panic!() };
+        assert_eq!(marked, "nihoa");
+        assert_eq!(panel.candidates[0], "你好");
+        assert_eq!(press(&mut s, Key::Enter).commit.as_deref(), Some("nihoa"));
     }
 
     #[test]

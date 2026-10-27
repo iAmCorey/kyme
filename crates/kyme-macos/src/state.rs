@@ -7,8 +7,10 @@ use std::time::{Duration, Instant};
 use core_graphics::event::KeyCode;
 use gpui::AsyncApp;
 use kyme_core::pinyin::Engine;
-use kyme_core::{Key, Mode, Modifiers, Response, Session, Settings, SettingsFile, View};
+use kyme_core::{Key, Mode, Modifiers, Pick, Response, Session, Settings, SettingsFile, View};
 use kyme_ui::Content;
+use objc2::Message;
+use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
 use objc2_foundation::NSRect;
@@ -34,6 +36,8 @@ pub struct AppState {
     panel: PanelWindow,
     app: AsyncApp,
     settings: SettingsFile,
+    /// 最近一次按键所在的输入框。鼠标点候选窗时往这里上屏。
+    client: Option<Retained<AnyObject>>,
     /// 客户端输入框里当前的 marked text，没变就不重复同步。
     marked: String,
     /// 每次显示中英提示加一，过期的隐藏任务据此作废。
@@ -81,8 +85,14 @@ pub fn finish_composition(client: &AnyObject) {
             client::insert_text(client, &text);
         }
         state.marked.clear();
+        state.client = None;
         state.panel.hide();
     });
+}
+
+/// 鼠标点了候选窗。
+pub fn pick(pick: Pick) {
+    with_state((), |state| state.pick(pick));
 }
 
 impl AppState {
@@ -92,6 +102,7 @@ impl AppState {
             panel,
             app,
             settings,
+            client: None,
             marked: String::new(),
             hint_generation: 0,
             timings: Timings::default(),
@@ -120,6 +131,7 @@ impl AppState {
 
     fn handle_event(&mut self, event: &NSEvent, client: &AnyObject) -> bool {
         let started = Instant::now();
+        self.client = Some(client.retain());
         let handled = match translate(event) {
             Some((key, mods)) => {
                 let response = self.session.handle_key(key, mods);
@@ -130,6 +142,12 @@ impl AppState {
         };
         self.timings.record(started.elapsed());
         handled
+    }
+
+    fn pick(&mut self, pick: Pick) {
+        let Some(client) = self.client.clone() else { return };
+        let response = self.session.pick(pick);
+        self.apply(response, &client);
     }
 
     /// 把会话的结果交给客户端和候选窗。返回这个键是否被输入法吃掉。

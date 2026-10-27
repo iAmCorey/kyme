@@ -6,11 +6,11 @@ use gpui::{
     App, AppContext, AsyncApp, Bounds, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
     WindowOptions, point, px, size,
 };
-use kyme_core::AppearanceSettings;
+use kyme_core::{AppearanceSettings, Pick};
 use kyme_ui::{CandidateView, Content};
 use objc2::rc::Retained;
 use objc2::{MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSEvent, NSScreen, NSView, NSWindow, NSWindowStyleMask};
+use objc2_app_kit::{NSEvent, NSPanel, NSScreen, NSView, NSWindow, NSWindowStyleMask};
 use objc2_core_graphics::{CGWindowLevelForKey, CGWindowLevelKey};
 use objc2_foundation::{NSPoint, NSPointInRect, NSRect, NSSize};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -26,7 +26,8 @@ pub struct PanelWindow {
 }
 
 impl PanelWindow {
-    pub fn open(cx: &mut App) -> Self {
+    /// `on_pick`：鼠标点了候选或翻页箭头，见 [`CandidateView::new`]。
+    pub fn open(cx: &mut App, on_pick: impl Fn(Pick) + 'static) -> Self {
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::new(
                 point(px(0.0), px(0.0)),
@@ -40,19 +41,24 @@ impl PanelWindow {
             window_background: WindowBackgroundAppearance::Transparent,
             ..Default::default()
         };
-        let handle =
-            cx.open_window(options, |_, cx| cx.new(|_| CandidateView::new(DEFAULT_FONT))).expect("创建候选窗失败");
+        let handle = cx
+            .open_window(options, |_, cx| cx.new(|_| CandidateView::new(DEFAULT_FONT, on_pick)))
+            .expect("创建候选窗失败");
         let window =
             handle.update(cx, |_, window, _| ns_window(window)).ok().flatten().expect("拿不到候选窗的 NSWindow");
 
-        // GPUI 的 PopUp 是带标题栏样式的面板，改成无边框；保留「不抢焦点」
+        // GPUI 的 PopUp 是带标题栏样式的面板，改成无边框；NonactivatingPanel 让点它时不激活本进程
         window.setStyleMask(NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel);
+        // 光不激活还不够：面板被点中仍会成为焦点窗口、拿走键盘焦点，正在输入的 App 随之失焦，
+        // 系统让输入法结束输入（拼音原样上屏、候选窗消失）。只在点到需要键盘的控件时才成为焦点窗口，候选窗里没有这种控件
+        match window.downcast_ref::<NSPanel>() {
+            Some(panel) => panel.setBecomesKeyOnlyIfNeeded(true),
+            None => log::warn!("候选窗不是 NSPanel，点它会打断输入"),
+        }
         // 层级放到光标层下面一点，盖得住 Spotlight 这类浮窗
         let level = CGWindowLevelForKey(CGWindowLevelKey::CursorWindowLevelKey) - 100;
         window.setLevel(level as isize);
         window.setHasShadow(true);
-        // demo 先只支持键盘选词，点击直接穿透到下面的 App
-        window.setIgnoresMouseEvents(true);
         PanelWindow { handle, window }
     }
 

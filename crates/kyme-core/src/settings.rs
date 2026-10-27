@@ -24,7 +24,7 @@ pub struct InputSettings {
     /// 输入时拼音显示在输入框里（默认），候选窗只有一行候选。关掉的话拼音显示在候选窗第一行，
     /// 输入框里只有选定的字（还没选时是一个占位）。
     pub inline_pinyin: bool,
-    /// 和整串拼音对得上的词后面，候选里跟上它的 emoji。
+    /// 候选第一页最后一格放一个 emoji，取自第一页里和整串拼音对得上的词。
     pub emoji: bool,
 }
 
@@ -87,7 +87,7 @@ pub const SETTINGS_TEMPLATE: &str = r##"# Kyme 设置。改完保存，切换一
 page_size = 7
 # 输入时拼音显示在输入框里，候选窗只有一行候选。false：拼音显示在候选窗第一行
 inline_pinyin = true
-# 候选里带 emoji：和打的拼音对得上的词后面跟着它的 emoji
+# 候选里带 emoji：第一页最后一格放一个和打的拼音对得上的 emoji
 emoji = true
 
 [appearance]

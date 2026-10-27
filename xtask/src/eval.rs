@@ -1,7 +1,8 @@
 //! 拼音评测：eval/pinyin.tsv 里每一条的首选都要对，单条转换和词库载入的耗时不能超过门槛。
 //!
-//! 「本来就对」这一类是照着打的输入，还要求从第一个字母打到最后一个，每一步显示的拼音字母都和打的一样。
-//! 同样的要求再放到最常用的音节两两拼接上（那按、下岸……），被改掉的比例不能超过门槛。
+//! 每一条都从第一个字母打到最后一个，每一步输入框显示的（preedit）都要是打的字母，纠过错的也一样。
+//! 「本来就对」这一类是照着打的输入，还要求每一步引擎理解的拼音（spelling）也和打的字母一样，
+//! 也就是没被当成打错。同样的要求再放到最常用的音节两两拼接上（那按、下岸……），被改掉的比例不能超过门槛。
 //!
 //! eval/pending.tsv（可选，格式相同）放暂时还做不到的用例：只报告不卡发版，哪条做到了会提示挪过去。
 
@@ -9,7 +10,7 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use kyme_core::pinyin::{Engine, SylId};
+use kyme_core::pinyin::{Conversion, Engine, SylId};
 
 use crate::report::Outcome;
 use crate::{Context, util};
@@ -69,9 +70,9 @@ fn evaluate(engine: &Engine, cases: &[Case]) -> Evaluation {
             result.hits.push(format!("[{category}] {input} → {expected}"));
         } else {
             result.misses.push(format!(
-                "[{category}] {input} → {}（期望 {expected}，拼音 {}）",
+                "[{category}] {input} → {}（期望 {expected}，读成 {}）",
                 top.join(" "),
-                conversion.preedit
+                conversion.spelling
             ));
         }
     }
@@ -81,13 +82,23 @@ fn evaluate(engine: &Engine, cases: &[Case]) -> Evaluation {
 /// 拿常用音节两两拼接的个数：80 个，6400 个输入。
 const COMMON_SYLLABLES: usize = 80;
 
-/// 打到每一步时显示的拼音（去掉分隔符）都要和已经打的字母一样，否则返回第一处被改的地方。
-fn first_altered(engine: &Engine, input: &str) -> Option<String> {
-    (1..=input.len()).find_map(|end| {
-        let typed = &input[..end];
-        let shown = engine.convert(typed).preedit;
-        (shown.replace('\'', "") != typed.replace('\'', "")).then(|| format!("打到 {typed} 时拼音显示成了 {shown}"))
+/// 从第一个字母打到最后一个，每一步从转换结果里取一份拼音，去掉分隔符后都要和已经打的字母一样。
+/// 返回第一处不一样的地方：已经打的字母，和那份拼音。
+fn first_changed<'a>(engine: &Engine, input: &'a str, pinyin: fn(Conversion) -> String) -> Option<(&'a str, String)> {
+    (1..=input.len()).map(|end| &input[..end]).find_map(|typed| {
+        let got = pinyin(engine.convert(typed));
+        (got.replace('\'', "") != typed.replace('\'', "")).then_some((typed, got))
     })
+}
+
+/// 引擎理解的拼音（spelling）没改打的字母，否则返回第一处被改的地方。
+fn first_altered(engine: &Engine, input: &str) -> Option<String> {
+    first_changed(engine, input, |c| c.spelling).map(|(typed, read)| format!("打到 {typed} 时被读成了 {read}"))
+}
+
+/// 输入框显示的（preedit）就是打的字母，纠过错的也一样，否则返回第一处不一样的地方。
+fn first_misshown(engine: &Engine, input: &str) -> Option<String> {
+    first_changed(engine, input, |c| c.preedit).map(|(typed, shown)| format!("打到 {typed} 时显示成了 {shown}"))
 }
 
 /// 照着打的那一类，每条只报第一处。
@@ -128,12 +139,16 @@ pub fn run(ctx: &mut Context) -> Outcome {
     let result = evaluate(&loaded.engine, &cases);
     let gates = &ctx.gates.engine;
 
+    let misshown: Vec<String> = cases.iter().filter_map(|case| first_misshown(&loaded.engine, &case.input)).collect();
     let altered = altered_prefixes(&loaded.engine, &cases);
     let (pairs, altered_pairs) = altered_pairs(&loaded.engine);
     let altered_percent = 100.0 * altered_pairs.len() as f64 / pairs.max(1) as f64;
     let mut problems = Vec::new();
     if !result.misses.is_empty() {
         problems.push(format!("{} 条没打对", result.misses.len()));
+    }
+    if !misshown.is_empty() {
+        problems.push(format!("{} 条输入打到一半时输入框显示的不是打的字母", misshown.len()));
     }
     if !altered.is_empty() {
         problems.push(format!("{} 条照着打的输入打到一半时拼音被改了", altered.len()));
@@ -164,6 +179,10 @@ pub fn run(ctx: &mut Context) -> Outcome {
         details.push("没打对的：".into());
         details.extend(result.misses.iter().map(|miss| format!("  {miss}")));
     }
+    if !misshown.is_empty() {
+        details.push("输入框显示的不是打的字母：".into());
+        details.extend(misshown.iter().map(|line| format!("  {line}")));
+    }
     if !altered.is_empty() {
         details.push("打到一半拼音被改的：".into());
         details.extend(altered.iter().map(|line| format!("  {line}")));
@@ -193,7 +212,7 @@ pub fn run(ctx: &mut Context) -> Outcome {
 
     if problems.is_empty() {
         let summary = format!(
-            "{} 条全对，照着打的拼音不被改（常用拼接 {altered_percent:.2}%），单条最慢 {}，词库载入 {}",
+            "{} 条全对，显示的都是打的字母，照着打的拼音不被改（常用拼接 {altered_percent:.2}%），单条最慢 {}，词库载入 {}",
             cases.len(),
             util::millis(result.slowest),
             util::millis(loaded.load_time)

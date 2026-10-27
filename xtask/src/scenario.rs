@@ -8,7 +8,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use kyme_core::{Key, Mode, Modifiers, Response, Session};
+use kyme_core::{Key, Mode, Modifiers, Pick, Response, Session};
 
 use crate::Context;
 use crate::report::Outcome;
@@ -22,6 +22,11 @@ pub struct Scenario {
 pub enum Stroke {
     Press(Press),
     Wait(Duration),
+    /// 鼠标点候选窗。`label` 是写进报告的名字，比如 `{click:2}`。
+    Click {
+        pick: Pick,
+        label: String,
+    },
 }
 
 /// 一个按键事件：会话看到的键，以及在 macOS 上怎么合成它。
@@ -127,6 +132,19 @@ fn special(name: &str) -> Result<Vec<Stroke>, String> {
         "shift-down" => Ok(vec![shift_down()]),
         "shift-up" => Ok(vec![shift_up()]),
         _ => {
+            if let Some(target) = name.strip_prefix("click:") {
+                let pick = match target {
+                    "prev" => Pick::PrevPage,
+                    "next" => Pick::NextPage,
+                    n => n
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|n| n.checked_sub(1))
+                        .map(Pick::Candidate)
+                        .ok_or_else(|| format!("{label} 里要写第几个候选（从 1 数）"))?,
+                };
+                return Ok(vec![Stroke::Click { pick, label }]);
+            }
             if let Some(ms) = name.strip_prefix("wait:") {
                 let ms = ms.parse().map_err(|_| format!("{label} 里要写毫秒数"))?;
                 return Ok(vec![Stroke::Wait(Duration::from_millis(ms))]);
@@ -198,10 +216,15 @@ pub struct Document {
 }
 
 impl Document {
-    pub fn apply(&mut self, press: &Press, response: &Response) -> Result<(), String> {
+    /// 输入法上屏的文字。
+    pub fn commit(&mut self, response: &Response) {
         if let Some(text) = &response.commit {
             self.text.push_str(text);
         }
+    }
+
+    pub fn apply(&mut self, press: &Press, response: &Response) -> Result<(), String> {
+        self.commit(response);
         // 输入法吃掉的键、修饰键本身、快捷键，都不会让文本框自己改文字
         if response.handled || press.flags_changed || press.mods != Modifiers::default() {
             return Ok(());
@@ -232,6 +255,7 @@ fn play(session: &mut Session, scenario: &Scenario) -> Result<String, String> {
                 let response = session.handle_key(press.key, press.mods);
                 document.apply(press, &response)?;
             }
+            Stroke::Click { pick, .. } => document.commit(&session.pick(*pick)),
         }
     }
     finish(session)?;
@@ -257,7 +281,7 @@ pub fn run(ctx: &mut Context) -> Outcome {
         Ok(scenarios) => scenarios,
         Err(err) => return Outcome::fail(err),
     };
-    // 用默认设置跑：期望不能依赖设置
+    // 用默认设置跑，不读你的 settings.toml：场景的期望照默认设置写
     let mut session = Session::new(loaded.engine);
     let mut failures = Vec::new();
     for scenario in &scenarios {
@@ -286,7 +310,7 @@ mod tests {
             .into_iter()
             .filter_map(|stroke| match stroke {
                 Stroke::Press(press) => Some(press),
-                Stroke::Wait(_) => None,
+                Stroke::Wait(_) | Stroke::Click { .. } => None,
             })
             .collect()
     }
@@ -319,6 +343,21 @@ mod tests {
         assert!(keys[4].flags_changed && !keys[4].command, "再松开 Command");
         assert_eq!(keys[6].key, Key::Char('{'));
         assert!(matches!(parse_keys("{wait:500}").unwrap()[..], [Stroke::Wait(d)] if d == Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn clicks() {
+        let strokes = parse_keys("{click:2}{click:prev}{click:next}").unwrap();
+        assert!(
+            matches!(&strokes[..], [
+                Stroke::Click { pick: Pick::Candidate(1), label },
+                Stroke::Click { pick: Pick::PrevPage, .. },
+                Stroke::Click { pick: Pick::NextPage, .. },
+            ] if label == "{click:2}"),
+            "场景里从 1 数，Pick 里从 0 数"
+        );
+        assert!(parse_keys("{click:0}").is_err());
+        assert!(parse_keys("{click:x}").is_err());
     }
 
     #[test]
