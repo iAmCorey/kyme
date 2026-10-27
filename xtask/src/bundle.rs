@@ -1,4 +1,4 @@
-//! 安装包检查：用 scripts/build-app.sh 组装 target/Kyme.app（不安装），
+//! 安装包检查：用 scripts/build-app.sh 组装 Kyme.app（不安装），
 //! 核对 Info.plist、可执行文件、图标、本地化字符串、词库和签名。
 
 use std::collections::BTreeMap;
@@ -22,6 +22,9 @@ const REQUIRED: [&str; 7] = [
     "InputMethodServerControllerClass",
     "tsInputMethodIconFileKey",
 ];
+/// scripts/build-app.sh 组装出来的 Kyme.app。放在 .noindex 目录里，Spotlight 不收录。
+pub const APP: &str = "target/app.noindex/Kyme.app";
+
 /// 输入模式里引用图标文件的字段。
 const MODE_ICONS: [&str; 3] =
     ["tsInputModeMenuIconFileKey", "tsInputModeAlternateMenuIconFileKey", "tsInputModePaletteIconFileKey"];
@@ -30,7 +33,7 @@ pub fn run(root: &Path) -> Outcome {
     if let Err(out) = util::capture(Command::new(root.join("scripts/build-app.sh")).current_dir(root)) {
         return Outcome::fail("组装 Kyme.app 失败").with_details(util::tail(&out, 20));
     }
-    let app = root.join("target/Kyme.app");
+    let app = root.join(APP);
     let contents = app.join("Contents");
     let info = match plist(&contents.join("Info.plist")) {
         Ok(info) => info,

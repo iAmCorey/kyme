@@ -17,8 +17,8 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 /// 候选窗和输入行之间的间距。
 const GAP: f64 = 4.0;
-/// 设置里没指定字体时用的中文字体。
-const DEFAULT_FONT: &str = "PingFang SC";
+/// 设置里没指定字体时用的中文字体，设置窗口的文字也用它。
+pub(crate) const DEFAULT_FONT: &str = "PingFang SC";
 
 pub struct PanelWindow {
     handle: WindowHandle<CandidateView>,

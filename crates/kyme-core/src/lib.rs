@@ -9,4 +9,6 @@ mod settings;
 
 pub use kyme_pinyin as pinyin;
 pub use session::{Key, Mode, Modifiers, Panel, Pick, Response, SELECT_KEYS, Session, View};
-pub use settings::{AppearanceSettings, InputSettings, Rgb, SETTINGS_TEMPLATE, Settings, SettingsFile};
+pub use settings::{
+    AppearanceSettings, FONT_SIZES, InputSettings, PAGE_SIZES, Rgb, SETTINGS_TEMPLATE, Settings, SettingsFile,
+};

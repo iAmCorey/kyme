@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::report::Outcome;
 use crate::scenario::{self, Press, Scenario, Stroke};
-use crate::{Context, util};
+use crate::{Context, bundle, util};
 
 /// 还没选定任何字时，输入框里放的占位符（只在拼音不显示在输入框里时用到），和 kyme-macos 的 state.rs 一致。
 const PLACEHOLDER: &str = "\u{3000}";
@@ -56,7 +56,7 @@ fn test(ctx: &mut Context) -> Result<Outcome, String> {
     let scenarios = scenario::load(&ctx.root)?;
     util::capture(Command::new(ctx.root.join("scripts/build-app.sh")).current_dir(&ctx.root))
         .map_err(|out| format!("组装 Kyme.app 失败：{}", util::tail(&out, 3).join(" / ")))?;
-    let mut kyme = Kyme::spawn(&ctx.root.join("target/Kyme.app/Contents/MacOS/Kyme"))?;
+    let mut kyme = Kyme::spawn(&ctx.root.join(bundle::APP).join("Contents/MacOS/Kyme"))?;
 
     // 自测模式用默认设置，参照也一样
     let mut oracle = Session::new(loaded.engine);

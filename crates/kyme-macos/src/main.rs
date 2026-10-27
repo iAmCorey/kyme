@@ -4,6 +4,7 @@
 //! - `Kyme --install [--select]`：向系统注册并启用输入法，可选地直接切换过去
 //! - `Kyme --current-source` / `Kyme --select-source <id>`：查看、切换当前输入源
 //! - `Kyme --qa`：自测模式，换上假的输入框跑输入会话，给 `cargo xtask qa` 用（见 qa.rs）
+//! - `Kyme --settings`：设置窗口（见 settings_window.rs）。不在「输入法」文件夹里的 Kyme.app 被打开时也是它
 
 mod client;
 mod controller;
@@ -11,6 +12,7 @@ mod install;
 mod logger;
 mod panel;
 mod qa;
+mod settings_window;
 mod state;
 
 use std::path::{Path, PathBuf};
@@ -43,15 +45,23 @@ fn main() {
             }
         },
         Some("--qa") => return qa::run(),
+        Some("--settings") => return settings_window::run(settings_path()),
         _ => {}
+    }
+    // 系统用的输入法装在「输入法」文件夹里。别处的 Kyme.app（比如 target 下组装出来的）被打开时，
+    // 再起一个输入法进程没有用，当作打开设置
+    if !installed() {
+        return settings_window::run(settings_path());
     }
 
     logger::init();
     log::info!("Kyme 启动，pid {}", std::process::id());
     let loading = load_engine_in_background();
-    Application::new().run(move |cx| {
-        let settings = library_dir().unwrap_or_default().join("Application Support/Kyme/settings.toml");
-        boot(cx, loading, SettingsFile::new(settings));
+    let app = Application::new();
+    // 输入法在跑的时候再打开一次 Kyme.app（启动台、Spotlight、访达）：打开设置
+    app.on_reopen(|_| settings_window::open());
+    app.run(move |cx| {
+        boot(cx, loading, SettingsFile::new(settings_path()));
         match start_server() {
             // IMKServer 要在整个进程生命周期里一直存在
             Some(server) => {
@@ -61,6 +71,17 @@ fn main() {
             None => log::error!("IMKServer 创建失败"),
         }
     });
+}
+
+/// 装在 ~/Library/Input Methods 或 /Library/Input Methods 里。
+fn installed() -> bool {
+    let bundle = PathBuf::from(NSBundle::mainBundle().bundlePath().to_string());
+    bundle.parent().is_some_and(|dir| dir.ends_with("Input Methods"))
+}
+
+/// `~/Library/Application Support/Kyme/settings.toml`
+fn settings_path() -> PathBuf {
+    library_dir().unwrap_or_default().join("Application Support/Kyme/settings.toml")
 }
 
 /// 词库在后台线程里读，同时初始化 GPUI 和候选窗。

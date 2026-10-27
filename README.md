@@ -43,7 +43,9 @@ scripts/dev-install.sh
 
 ## 设置
 
-`~/Library/Application Support/Kyme/settings.toml`，首次使用时生成，各项见文件里的注释。保存后切换一下输入框生效。
+输入法菜单里选「Kyme 设置…」，或从 Spotlight、启动台打开 Kyme。
+
+也可以直接改 `~/Library/Application Support/Kyme/settings.toml`，保存后切换一下输入框生效。
 
 ## 开发
 

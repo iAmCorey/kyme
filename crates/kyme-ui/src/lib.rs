@@ -1,4 +1,6 @@
-//! GPUI 界面：候选窗。三个桌面端共用，平台层只决定窗口放在哪、什么时候显示。
+//! GPUI 界面：候选窗和设置窗口。三个桌面端共用，平台层只决定窗口放在哪、什么时候显示。
+
+mod settings;
 
 use std::rc::Rc;
 
@@ -8,6 +10,7 @@ use gpui::{
     font, px, rgb, rgba, size,
 };
 use kyme_core::{AppearanceSettings, Mode, Panel, Pick, Rgb, SELECT_KEYS};
+pub use settings::SettingsView;
 
 /// 其余尺寸都按 15pt 的候选字号设计，换字号时等比缩放。
 const BASE_FONT_SIZE: f32 = 15.0;
@@ -86,13 +89,16 @@ impl CandidateView {
                 }
                 let preedit = width_of(&panel.preedit, m.preedit);
                 let width = row.max(preedit).max(m.min_width) + (m.pad + BORDER) * 2.0 + SLACK;
-                // 拼音显示在输入框里时，候选窗没有拼音那一行
-                let preedit_row = if panel.preedit.is_empty() { 0.0 } else { m.preedit_line + m.row_gap };
-                let height = (m.pad + BORDER) * 2.0 + preedit_row + m.row;
-                size(px(width.ceil()), px(height.ceil()))
+                size(px(width.ceil()), px(panel_height(&m, !panel.preedit.is_empty())))
             }
         }
     }
+}
+
+/// 候选窗的高度，只看字号和有没有拼音那一行（拼音显示在输入框里时没有），不用量文字。
+fn panel_height(m: &Metrics, preedit_row: bool) -> f32 {
+    let preedit_row = if preedit_row { m.preedit_line + m.row_gap } else { 0.0 };
+    ((m.pad + BORDER) * 2.0 + preedit_row + m.row).ceil()
 }
 
 fn mode_label(mode: Mode) -> &'static str {

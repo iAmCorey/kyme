@@ -65,7 +65,7 @@ expect = "下方放不下时候选窗翻到输入行上方、不超出屏幕；�
 [[check]]
 app = "浅色 / 深色模式"
 steps = "分别在浅色和深色模式下输入 nihao"
-expect = "候选窗文字清楚；菜单栏的 Kyme 图标在两种模式下都看得清，边缘平滑没有锯齿（内置屏和外接屏都看一下）"
+expect = "候选窗和设置窗口的文字清楚；菜单栏的 Kyme 图标在两种模式下都看得清，边缘平滑没有锯齿（内置屏和外接屏都看一下）"
 
 [[check]]
 app = "中英切换提示"
@@ -73,6 +73,11 @@ steps = "轻点一下 Shift，再点一下"
 expect = "光标旁依次短暂显示「英」「中」，约 0.7 秒后消失；中英状态跟着切换"
 
 [[check]]
-app = "设置"
-steps = "把 ~/Library/Application Support/Kyme/settings.toml 改成 page_size = 10、highlight_color = \"#07C160\"，保存后切换一下输入框，输入 ni 再按 0"
-expect = "候选变成每页 10 个，序号是 1–9 和 0，按 0 选中第 10 个；高亮变成绿色；改回去后恢复"
+app = "设置窗口"
+steps = "点菜单栏的输入法图标，选「Kyme 设置…」；每页候选改成 10、高亮色选绿色、字号点大几下；回到备忘录输入 ni 再按 0。设置窗口开着时从 Spotlight 打开 Kyme，最后按 ⌘W"
+expect = "设置窗口出现在最前面；预览跟着变，字号变大时窗口往下长、顶边不动；备忘录里每页 10 个、按 0 选中第 10 个、高亮是绿色、字变大；从 Spotlight 打开只把设置窗口叫到前面，不多开；⌘W 关掉窗口；settings.toml 里的注释还在"
+
+[[check]]
+app = "设置文件"
+steps = "把 ~/Library/Application Support/Kyme/settings.toml 的 page_size 改成 6，保存后切换一下输入框，输入 ni；再把文件改坏（比如删掉一个 ]）后打开设置窗口"
+expect = "候选变成每页 6 个；文件改坏时设置窗口底部用红字说哪一行错了，点选项不会覆盖文件；改回去后恢复"

@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-APP="target/Kyme.app"
+APP="target/app.noindex/Kyme.app"
 DEST="$HOME/Library/Input Methods/Kyme.app"
 
 scripts/build-app.sh

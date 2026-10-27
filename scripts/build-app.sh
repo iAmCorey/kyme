@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# 构建并组装 target/Kyme.app（ad-hoc 签名），不安装。dev-install.sh 和 cargo xtask qa 都用它。
+# 构建并组装 Kyme.app（ad-hoc 签名），不安装。dev-install.sh 和 cargo xtask qa 都用它。
+# 放在 .noindex 目录里：Spotlight 不收录，搜「Kyme」只会找到装好的那份。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-APP="target/Kyme.app"
+APP="target/app.noindex/Kyme.app"
 
 # 词库已是锁定的版本时它会直接退出
 scripts/fetch-dict.sh

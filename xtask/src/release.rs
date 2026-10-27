@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use crate::report::Outcome;
-use crate::util;
+use crate::{bundle, util};
 
 pub fn run(root: &Path) -> Outcome {
     let mut problems = Vec::new();
@@ -16,7 +16,7 @@ pub fn run(root: &Path) -> Outcome {
     }
     if !root.join("LICENSE").is_file() {
         problems.push("仓库根目录没有 LICENSE：项目和雾凇词库都是 GPL-3.0，发布时要附上许可证全文".into());
-    } else if !root.join("target/Kyme.app/Contents/Resources/LICENSE").is_file() {
+    } else if !root.join(bundle::APP).join("Contents/Resources/LICENSE").is_file() {
         problems.push("Kyme.app 里没有 LICENSE：先跑安装包检查，scripts/build-app.sh 会把它放进去".into());
     }
     match head {

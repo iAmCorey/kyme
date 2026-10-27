@@ -14,7 +14,7 @@ cargo test -p kyme-core zero_selects    # 跑单个测试，按名字过滤
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all                         # rustfmt.toml：max_width 120
 scripts/fetch-dict.sh                   # 下载词库到 data/rime-ice/（不进 git），评测和打包都要它
-scripts/build-app.sh                    # 组装 target/Kyme.app，不安装
+scripts/build-app.sh                    # 组装 target/app.noindex/Kyme.app（Spotlight 不收录），不安装
 scripts/dev-install.sh                  # 装到 ~/Library/Input Methods 并启用，会重启正在用的输入法
 swift scripts/make-icons.swift          # 改了图标之后重新生成 AppIcon.icns 和 kyme.pdf
 cargo run --release -p kyme-pinyin --example repl -- data/rime-ice/8105.dict.yaml data/rime-ice/base.dict.yaml
@@ -28,12 +28,14 @@ cargo run --release -p kyme-pinyin --example repl -- data/rime-ice/8105.dict.yam
 
 鼠标点候选窗的路径：`kyme-ui` 等 GPUI 处理完这次鼠标事件再回调 → `state::pick` → `Session::pick`（选字键和翻页键也走它），结果交给最近一次按键所在的输入框。
 
+设置窗口是单独的进程 `Kyme --settings`（`settings_window.rs`），界面是 `kyme-ui` 的 `SettingsView`。输入法菜单的「Kyme 设置…」（IMK 的 `menu` 和 `showPreferences:`）、输入法在跑时再打开一次 Kyme.app（`on_reopen`）、打开不在「输入法」文件夹里的 Kyme.app，都会拉起它；已经开着就只把它叫到前面（靠 `$TMPDIR/kyme-settings.sock`）。改动用 `SettingsFile::save` 写回，只改值、注释照旧。
+
 - **`kyme-pinyin`**：引擎。负责音节切分（含简拼和没打完的末尾音节），按一元词频在词图上做 Viterbi 组句，再做手误纠错。另外带一张 emoji 对照表。`Engine::load_dir` 读整个数据目录（`*.dict.yaml` 和 `emoji.txt`），输入法和 xtask 都用它。
 - **`kyme-core`**：和平台无关的输入会话，包括候选、翻页、中英切换、标点、emoji 插入，还有设置文件。
   - 设置文件在 `~/Library/Application Support/Kyme/settings.toml`，每次切到一个输入框时检查有没有改过。`SETTINGS_TEMPLATE` 必须等于默认值，有测试守着。
   - `SELECT_KEYS` 是选字键、候选窗序号和每页上限的唯一来源。
-- **`kyme-ui`**：GPUI 候选窗。尺寸都在 `Metrics` 里按字号等比缩放；平台层先 `measure()`，再摆放窗口。
-- **`kyme-macos`**：同一个可执行文件兼任输入法进程、安装工具（`--install`）和自测模式（`--qa`）。IMK 回调和 GPUI 都跑在主线程，全局状态放在 thread_local 里。
+- **`kyme-ui`**：GPUI 候选窗和设置窗口。尺寸都在 `Metrics` 里按字号等比缩放；平台层先 `measure()`，再摆放窗口。
+- **`kyme-macos`**：同一个可执行文件兼任输入法进程、安装工具（`--install`）、自测模式（`--qa`）和设置窗口（`--settings`）。IMK 回调和 GPUI 都跑在主线程，全局状态放在 thread_local 里。
 - **`xtask`**：QA。`Kyme --qa` 用一个假的 IMK 输入框，跑真正的会话、接入层和候选窗，每个键都和本地的参照 `Session` 对照。
 
 ## 纠错的硬规则
@@ -54,6 +56,7 @@ cargo run --release -p kyme-pinyin --example repl -- data/rime-ice/8105.dict.yam
 - **授权弹窗**：macOS 26 上调用 `TISEnableInputSource` 会弹授权窗。`--install` 会跳过已经启用的输入源，`build-app.sh` 的签名要求只认 bundle ID，所以重装不会再弹。
 - **菜单栏图标**：改了图标并重装后，要 `killall TextInputMenuAgent` 才看得到新图标，系统会自动把它拉起来。
 - **候选窗不会出现在截图里**：要查它是否显示、在什么位置，用 `CGWindowListCopyWindowInfo`。
+- **看设置窗口**：它是普通窗口，`screencapture -l <窗口号>` 截得到。`HOME=<临时目录> TMPDIR=<临时目录> Kyme --settings` 用临时的设置文件，也不会只去叫你开着的那个设置窗口。
 
 ## 数据和发版
 
