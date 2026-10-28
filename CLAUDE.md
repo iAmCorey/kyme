@@ -7,9 +7,10 @@ Kyme：开源、AI 原生的中文输入法，先做 macOS。全栈 Rust，候�
 ## 常用命令
 
 ```bash
-cargo xtask qa                          # 整套检查：格式、clippy、单元测试、评测、按键场景、安装包、macOS 接入层，约 1 分钟
-cargo xtask qa --only eval,scenarios    # 只跑部分检查；改了引擎至少跑这两项
-cargo xtask qa --release                # 发版：再加发版要求（已提交、LICENSE）和人工检查清单
+cargo xtask qa                          # 按改动挑检查：只跑和还没推送的改动有关的几项，平时用它
+cargo xtask qa --all                    # 全部自动检查：格式、clippy、单元测试、评测、按键场景、安装包、macOS 接入层，约 1 分钟
+cargo xtask qa --only eval,scenarios    # 只跑列出的检查
+cargo xtask qa --release                # 发版才跑：全部检查，再加发版要求（已提交、LICENSE）和人工检查清单
 cargo test -p kyme-core zero_selects    # 跑单个测试，按名字过滤
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all                         # rustfmt.toml：max_width 120
@@ -33,6 +34,7 @@ cargo run --release -p kyme-pinyin --example repl -- data/rime-ice/8105.dict.yam
 - **`kyme-pinyin`**：引擎。负责音节切分（含简拼和没打完的末尾音节），按一元词频在词图上做 Viterbi 组句，再做手误纠错。另外带一张 emoji 对照表。`Engine::load_dir` 读整个数据目录（`*.dict.yaml` 和 `emoji.txt`），输入法和 xtask 都用它。
 - **`kyme-core`**：和平台无关的输入会话，包括候选、翻页、中英切换、标点、emoji 插入，还有设置文件。
   - 设置文件在 `~/Library/Application Support/Kyme/settings.toml`，每次切到一个输入框时检查有没有改过。`SETTINGS_TEMPLATE` 必须等于默认值，有测试守着。
+  - 选词记忆：`kyme-pinyin` 的 `UserDict` 是纯数据，`Engine::convert_with` 带上它组句，只进照着打的读法、不进纠错的读法；`kyme-core` 的 `UserDictFile` 读写同目录的 `userdict.tsv`。会话要挂上用户词库（`set_user_words`）才学词，按键场景和 `Kyme --qa` 都不挂。
   - `SELECT_KEYS` 是选字键、候选窗序号和每页上限的唯一来源。
 - **`kyme-ui`**：GPUI 候选窗和设置窗口。尺寸都在 `Metrics` 里按字号等比缩放；平台层先 `measure()`，再摆放窗口。
 - **`kyme-macos`**：同一个可执行文件兼任输入法进程、安装工具（`--install`）、自测模式（`--qa`）和设置窗口（`--settings`）。IMK 回调和 GPUI 都跑在主线程，全局状态放在 thread_local 里。

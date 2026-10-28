@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use core_graphics::event::KeyCode;
 use gpui::AsyncApp;
 use kyme_core::pinyin::Engine;
-use kyme_core::{Key, Mode, Modifiers, Pick, Response, Session, Settings, SettingsFile, View};
+use kyme_core::{Key, Mode, Modifiers, Pick, Response, Session, Settings, SettingsFile, UserDictFile, View, today};
 use kyme_ui::Content;
 use objc2::Message;
 use objc2::rc::Retained;
@@ -19,7 +19,11 @@ use crate::client;
 use crate::panel::PanelWindow;
 
 /// 中英提示显示多久。
-const HINT_DURATION: Duration = Duration::from_millis(700);
+const HINT_DURATION: Duration = Duration::from_millis(1500);
+/// 一个键处理超过这么久就写进日志。
+const SLOW_KEY: Duration = Duration::from_millis(100);
+/// 学到新词后停这么久再存盘，打字时不反复写文件。
+const SAVE_DELAY: Duration = Duration::from_secs(10);
 /// 小键盘上的回车，core-graphics 没有这个常量。
 const KEYPAD_ENTER: u16 = 0x4c;
 /// 不显示内嵌拼音、又还没选定任何字时，输入框里放的占位符（全角空格）。
@@ -36,6 +40,10 @@ pub struct AppState {
     panel: PanelWindow,
     app: AsyncApp,
     settings: SettingsFile,
+    /// 用户词库的文件。自测模式不读也不写。
+    userdict: Option<UserDictFile>,
+    /// 学到了新词，还没存盘。从无到有时安排一次存盘，这段时间里再学到的一起存。
+    unsaved: bool,
     /// 最近一次按键所在的输入框。鼠标点候选窗时往这里上屏。
     client: Option<Retained<AnyObject>>,
     /// 客户端输入框里当前的 marked text，没变就不重复同步。
@@ -55,7 +63,10 @@ fn with_state<R>(fallback: R, f: impl FnOnce(&mut AppState) -> R) -> R {
     STATE.with(|cell| match cell.try_borrow_mut() {
         Ok(mut slot) => match slot.as_mut() {
             Some(state) => f(state),
-            None => fallback,
+            None => {
+                log::warn!("输入法还没准备好，本次按键交还给 App");
+                fallback
+            }
         },
         Err(_) => {
             log::warn!("IMK 回调重入，本次按键交还给 App");
@@ -68,9 +79,12 @@ pub fn handle_event(event: &NSEvent, client: &AnyObject) -> bool {
     with_state(false, |state| state.handle_event(event, client))
 }
 
-/// 每次切到一个输入框时调用。顺便检查设置文件有没有改过。
+/// 每次切到一个输入框时调用。顺便检查设置文件和用户词库有没有改过。
 pub fn activate() {
-    with_state((), AppState::reload_settings);
+    with_state((), |state| {
+        state.reload_settings();
+        state.reload_user_words();
+    });
 }
 
 /// 候选窗正显示着的话，它的位置（屏幕坐标，原点在左下）。自测模式用。
@@ -87,6 +101,7 @@ pub fn finish_composition(client: &AnyObject) {
         state.marked.clear();
         state.client = None;
         state.panel.hide();
+        state.save_user_words();
     });
 }
 
@@ -96,19 +111,70 @@ pub fn pick(pick: Pick) {
 }
 
 impl AppState {
-    pub fn new(engine: Arc<Engine>, panel: PanelWindow, app: AsyncApp, settings: SettingsFile) -> Self {
+    pub fn new(
+        engine: Arc<Engine>,
+        panel: PanelWindow,
+        app: AsyncApp,
+        settings: SettingsFile,
+        userdict: Option<UserDictFile>,
+    ) -> Self {
         let mut state = AppState {
             session: Session::new(engine),
             panel,
             app,
             settings,
+            userdict,
+            unsaved: false,
             client: None,
             marked: String::new(),
             hint_generation: 0,
             timings: Timings::default(),
         };
         state.reload_settings();
+        // 有用户词库文件才挂上用户词库、开始学词；文件还不在就从空的开始
+        if state.userdict.is_some() {
+            state.session.set_user_words(Vec::new());
+            state.reload_user_words();
+        }
         state
+    }
+
+    /// 用户词库的文件被别人改过（比如设置窗口清除了）就重读。
+    fn reload_user_words(&mut self) {
+        let Some(file) = &mut self.userdict else { return };
+        if let Some(words) = file.reload(self.session.engine().dictionary().table(), today()) {
+            log::info!("用户词库载入：{} 个词", words.len());
+            self.session.set_user_words(words);
+            self.unsaved = false;
+        }
+    }
+
+    /// 过一会儿在主线程上对全局状态做 `f`。
+    fn after(&self, delay: Duration, f: impl FnOnce(&mut AppState) + 'static) {
+        let timer = self.app.background_executor().timer(delay);
+        self.app
+            .foreground_executor()
+            .spawn(async move {
+                timer.await;
+                with_state((), f);
+            })
+            .detach();
+    }
+
+    fn save_user_words(&mut self) {
+        if !self.unsaved {
+            return;
+        }
+        // 这期间文件被清除了：以文件为准，清掉的词不再写回去
+        if self.userdict.as_ref().is_some_and(UserDictFile::changed) {
+            self.reload_user_words();
+            return;
+        }
+        let Some(file) = &mut self.userdict else { return };
+        match file.save(self.session.engine().dictionary().table(), self.session.user_words()) {
+            Ok(()) => self.unsaved = false,
+            Err(err) => log::warn!("用户词库存不进去：{err}"),
+        }
     }
 
     fn reload_settings(&mut self) {
@@ -140,7 +206,11 @@ impl AppState {
             }
             None => false,
         };
-        self.timings.record(started.elapsed());
+        let elapsed = started.elapsed();
+        if elapsed > SLOW_KEY {
+            log::warn!("一个键处理了 {elapsed:?}");
+        }
+        self.timings.record(elapsed);
         handled
     }
 
@@ -181,6 +251,9 @@ impl AppState {
         if let Some(mode) = response.mode_changed {
             self.show_mode(mode, client);
         }
+        if response.learned && self.userdict.is_some() && !std::mem::replace(&mut self.unsaved, true) {
+            self.after(SAVE_DELAY, AppState::save_user_words);
+        }
         response.handled
     }
 
@@ -190,18 +263,11 @@ impl AppState {
         let caret = client::caret_rect(client);
         let appearance = &self.session.settings().appearance;
         self.panel.show(&self.app, Content::Mode(mode), appearance, caret);
-        let timer = self.app.background_executor().timer(HINT_DURATION);
-        self.app
-            .foreground_executor()
-            .spawn(async move {
-                timer.await;
-                with_state((), |state| {
-                    if state.hint_generation == generation && !state.session.is_composing() {
-                        state.panel.hide();
-                    }
-                });
-            })
-            .detach();
+        self.after(HINT_DURATION, move |state| {
+            if state.hint_generation == generation && !state.session.is_composing() {
+                state.panel.hide();
+            }
+        });
     }
 }
 

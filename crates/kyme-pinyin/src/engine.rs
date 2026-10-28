@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use crate::dict::{Dictionary, LoadError, read_file};
 use crate::emoji::Emoji;
 use crate::syllable::{SylId, SylSet, SyllableTable};
+use crate::user::UserDict;
 
 /// 一个词最多跨几个音节。
 const MAX_WORD_SYLS: usize = 8;
@@ -46,6 +47,8 @@ const RAW_COST: f64 = 40.0;
 const LATTICE_WIDTH: usize = 3;
 /// 候选列表的上限。
 const MAX_CANDIDATES: usize = 60;
+/// 不带用户词库时用的空词库。
+static NO_USER_WORDS: UserDict = UserDict::empty();
 
 #[derive(Clone, Copy, Debug)]
 enum Constraint {
@@ -267,6 +270,8 @@ pub struct Candidate {
     pub text: String,
     /// 选中它会消耗掉输入串的前多少个字节。
     pub consumed: usize,
+    /// 读音，学词用。emoji 和带着原样字母的整句没有读音，是空的。
+    pub syllables: Vec<SylId>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -280,12 +285,19 @@ pub struct Conversion {
     pub candidates: Vec<Candidate>,
 }
 
+/// 词图里的一个词：主词库的词条，或者用户词库里的词。
+#[derive(Clone, Copy)]
+enum Word {
+    Main(u32),
+    User(u32),
+}
+
 /// 组句路径上的一步。
 #[derive(Clone)]
 enum Step {
     Separator,
     Raw,
-    Word { entry: u32, segs: Vec<Seg> },
+    Word { word: Word, segs: Vec<Seg> },
 }
 
 pub struct Engine {
@@ -328,24 +340,35 @@ impl Engine {
 
     /// 把一串拼音（小写字母，可用 `'` 分隔）转成候选。第一个候选是整句最优解。
     pub fn convert(&self, input: &str) -> Conversion {
+        self.convert_with(input, &NO_USER_WORDS)
+    }
+
+    /// 带上用户词库转换：常选的词更靠前，学到的新词也能出。纠错的读法不用用户词，
+    /// 用户词只会让照着打的读法更占优，打对的拼音就更不会被改。
+    pub fn convert_with(&self, input: &str, user: &UserDict) -> Conversion {
         if input.is_empty() {
             return Conversion::default();
         }
         // 一个元音都没有是在打简拼（rgzn），不纠错
         if !input.bytes().any(|b| VOWELS.contains(&b)) {
-            return self.solve(input, Reading::Plain).conversion;
+            return self.solve(input, Reading::Plain, user).conversion;
         }
-        let best = self.solve(input, Reading::Corrected);
+        let best = self.solve(input, Reading::Corrected, user);
         if !best.corrected {
             return best.conversion;
         }
         // 用了纠错的话，要比照着打的读法明显更合理才算数（naanni 照着打是 na'an'ni「那按你」，
-        // 不能被读成 nan'ni「南宁」）。拼不通的输入只能逐个字母原样保留，照着打的那边代价极高
-        let literal = self.solve(input, Reading::Literal);
+        // 不能被读成 nan'ni「南宁」）。拼不通的输入只能逐个字母原样保留，照着打的那边代价极高。
+        // 比的时候纠错这边一个用户词都不用：用户词只该让照着打的读法更占优
+        let best = if user.is_empty() { best } else { self.solve(input, Reading::Corrected, &NO_USER_WORDS) };
+        if !best.corrected {
+            return self.solve(input, Reading::Plain, user).conversion;
+        }
+        let literal = self.solve(input, Reading::Literal, user);
         if best.cost + TYPO_MARGIN < literal.cost {
             return best.conversion;
         }
-        let mut plain = self.solve(input, Reading::Plain).conversion;
+        let mut plain = self.solve(input, Reading::Plain, user).conversion;
         // 照着打的读法以没打完的音节结尾、纠错改的又正是它：分不清是还没打完还是最后一下按错了
         // （suho 可能要接着打 suhong，也可能是想打「说」）。首选按照着打的读法，纠错的整句排第二，按 2 就能选
         let at_tail = matches!((literal.unfinished_from, best.last_fix_end), (Some(tail), Some(end)) if end > tail);
@@ -358,7 +381,7 @@ impl Engine {
         plain
     }
 
-    fn solve(&self, input: &str, reading: Reading) -> Solution {
+    fn solve(&self, input: &str, reading: Reading, user: &UserDict) -> Solution {
         let bytes = input.as_bytes();
         let n = bytes.len();
         // 每个位置能切出的单个音节只算一次，各个起点的切分共用
@@ -378,11 +401,11 @@ impl Engine {
                 relax(&mut cost, &mut back, i, i + 1, here, || Step::Separator);
                 continue;
             }
-            let spans = self.spans_from(input, &options, i);
+            let spans = self.spans_from(input, &options, i, user);
             for span in &spans {
-                for (entry, word_cost) in self.lookup(span, LATTICE_WIDTH) {
+                for (word, word_cost) in self.lookup(span, LATTICE_WIDTH, span_user(span, user)) {
                     let total = here + word_cost + span.penalty + WORD_PENALTY;
-                    relax(&mut cost, &mut back, i, span.end, total, || Step::Word { entry, segs: span.segs.clone() });
+                    relax(&mut cost, &mut back, i, span.end, total, || Step::Word { word, segs: span.segs.clone() });
                 }
             }
             relax(&mut cost, &mut back, i, i + 1, here + RAW_COST, || Step::Raw);
@@ -406,6 +429,8 @@ impl Engine {
         // 两份都在音节之间加分隔符，用户自己打的分隔符原样保留
         let table = self.dict.table();
         let mut sentence = String::new();
+        let mut syllables = Vec::new();
+        let mut has_raw = false;
         let mut preedit = String::with_capacity(n + 8);
         let mut spelling = String::with_capacity(n + 8);
         let mut after_syllable = false;
@@ -416,8 +441,9 @@ impl Engine {
         for (start, end, step) in &steps {
             boundaries.insert(*end);
             match step {
-                Step::Word { entry, segs } => {
-                    sentence.push_str(self.dict.text(*entry));
+                Step::Word { word, segs } => {
+                    sentence.push_str(self.word_text(user, *word));
+                    syllables.extend_from_slice(self.word_syllables(user, *word));
                     // 纠过错的词整个照原样显示：纠正可能挪动了字母（nhiao 是 ni'hao），按音节切开反而对不上
                     let fixed_word = segs.iter().any(|seg| seg.fixed.is_some());
                     sentence_corrected |= fixed_word;
@@ -442,6 +468,7 @@ impl Engine {
                 Step::Raw => {
                     let raw = &input[*start..*end];
                     sentence.push_str(raw);
+                    has_raw = true;
                     push_part(&mut preedit, after_syllable, raw);
                     push_part(&mut spelling, after_syllable, raw);
                     after_syllable = false;
@@ -457,27 +484,30 @@ impl Engine {
         // 其余候选：从开头起能组成的词，覆盖得越长越靠前，同样长度按代价排。
         // 只要在首选读法的音节边界上结束的（kaihui 不出「开花」，那会剩下打不出来的 ui）；
         // 首选没用到纠错，就说明打得没错，也不出纠错得来的词
-        let mut words_from_start: Vec<(usize, f64, u32)> = Vec::new();
+        let mut words_from_start: Vec<(usize, f64, Word)> = Vec::new();
         for span in &spans_from_start {
             let corrected = span.segs.iter().any(|seg| seg.fixed.is_some());
             if !boundaries.contains(&span.end) || (corrected && !sentence_corrected) {
                 continue;
             }
-            for (entry, cost) in self.lookup(span, MAX_CANDIDATES) {
-                words_from_start.push((span.end, cost + span.penalty, entry));
+            for (word, cost) in self.lookup(span, MAX_CANDIDATES, span_user(span, user)) {
+                words_from_start.push((span.end, cost + span.penalty, word));
             }
         }
         words_from_start.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.total_cmp(&b.1)));
 
-        let mut candidates = vec![Candidate { text: sentence, consumed: n }];
+        // 带着原样字母的整句没有完整的读音，不拿来学词
+        let syllables = if has_raw { Vec::new() } else { syllables };
+        let mut candidates = vec![Candidate { text: sentence, consumed: n, syllables }];
         let mut seen: HashSet<String> = candidates.iter().map(|c| c.text.clone()).collect();
-        for (end, _, entry) in words_from_start {
+        for (end, _, word) in words_from_start {
             if candidates.len() >= MAX_CANDIDATES {
                 break;
             }
-            let text = self.dict.text(entry);
+            let text = self.word_text(user, word);
             if seen.insert(text.to_string()) {
-                candidates.push(Candidate { text: text.to_string(), consumed: end });
+                let syllables = self.word_syllables(user, word).to_vec();
+                candidates.push(Candidate { text: text.to_string(), consumed: end, syllables });
             }
         }
 
@@ -491,12 +521,13 @@ impl Engine {
     }
 
     /// 从 `start` 出发能切出的所有音节序列（最多 MAX_WORD_SYLS 个音节）。
-    fn spans_from(&self, input: &str, options: &[Vec<Choice>], start: usize) -> Vec<Span> {
+    fn spans_from(&self, input: &str, options: &[Vec<Choice>], start: usize, user: &UserDict) -> Vec<Span> {
         let mut spans = Vec::new();
-        self.extend_spans(input, options, start, &mut Vec::new(), false, &mut spans);
+        self.extend_spans(input, options, start, &mut Vec::new(), false, user, &mut spans);
         spans
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn extend_spans(
         &self,
         input: &str,
@@ -504,6 +535,7 @@ impl Engine {
         pos: usize,
         path: &mut Vec<Seg>,
         corrected: bool,
+        user: &UserDict,
         spans: &mut Vec<Span>,
     ) {
         let bytes = input.as_bytes();
@@ -517,7 +549,7 @@ impl Engine {
             path.push(choice.first);
             path.extend(choice.second);
             // 词库里没有以这几个音节开头的词，就不必再往下切
-            if self.has_words_starting_with(path) {
+            if self.has_words_starting_with(path, user) {
                 let end = choice.end();
                 spans.push(Span { end, segs: path.clone(), penalty: path.iter().map(|s| s.penalty).sum() });
                 let mut next = end;
@@ -525,17 +557,21 @@ impl Engine {
                     next += 1;
                 }
                 if next < bytes.len() && path.len() < MAX_WORD_SYLS {
-                    self.extend_spans(input, options, next, path, corrected || fixes, spans);
+                    self.extend_spans(input, options, next, path, corrected || fixes, user, spans);
                 }
             }
             path.truncate(depth);
         }
     }
 
-    fn has_words_starting_with(&self, segs: &[Seg]) -> bool {
+    fn has_words_starting_with(&self, segs: &[Seg], user: &UserDict) -> bool {
         let table = self.dict.table();
         let initials: Vec<u8> = segs.iter().map(|seg| seg.constraint.initial(table)).collect();
-        self.dict.has_abbr_prefix(&initials) && exact_ids(segs).is_none_or(|ids| self.dict.has_exact_prefix(&ids))
+        let exact = exact_ids(segs);
+        let in_main =
+            self.dict.has_abbr_prefix(&initials) && exact.as_deref().is_none_or(|ids| self.dict.has_exact_prefix(ids));
+        // 学到的新词不在主词库里，也要查，不然会在切分时被剪掉
+        in_main || (user.has_abbr_prefix(&initials) && exact.as_deref().is_none_or(|ids| user.has_exact_prefix(ids)))
     }
 
     /// 在 `pos` 处按 `reading` 允许的各种切法：打全了的音节、纠错得来的音节、
@@ -622,27 +658,62 @@ impl Engine {
         options
     }
 
-    /// 查出与这一段匹配的词，按代价从低到高，最多 `limit` 个。
-    fn lookup(&self, span: &Span, limit: usize) -> Vec<(u32, f64)> {
-        let exact = exact_ids(&span.segs);
-        if let Some(entries) = exact.as_deref().and_then(|ids| self.dict.exact(ids)) {
-            return entries.take(limit).map(|entry| (entry, self.dict.cost(entry))).collect();
-        }
-
+    /// 查出与这一段匹配的词，按代价从低到高，最多 `limit` 个。用户词按加过分的代价和主词库的词一起排，
+    /// 主词库里排在后面的词，用户常选的话也能排进来。
+    fn lookup(&self, span: &Span, limit: usize, user: &UserDict) -> Vec<(Word, f64)> {
         let table = self.dict.table();
+        let exact = exact_ids(&span.segs);
         let initials: Vec<u8> = span.segs.iter().map(|seg| seg.constraint.initial(table)).collect();
-        let mut found = Vec::new();
-        for entry in self.dict.abbr(&initials) {
-            let ids = self.dict.syllables(entry);
-            if ids.iter().zip(&span.segs).all(|(&id, seg)| seg.constraint.matches(id)) {
-                found.push((entry, self.dict.cost(entry)));
-                if found.len() >= limit {
-                    break;
-                }
+        let fits = |ids: &[SylId]| ids.iter().zip(&span.segs).all(|(&id, seg)| seg.constraint.matches(id));
+        let main = |entry: u32| (Word::Main(entry), self.dict.cost(entry));
+        let mut found: Vec<(Word, f64)> = match exact.as_deref().and_then(|ids| self.dict.exact(ids)) {
+            Some(entries) => entries.take(limit).map(main).collect(),
+            None => self
+                .dict
+                .abbr(&initials)
+                .filter(|&entry| fits(self.dict.syllables(entry)))
+                .take(limit)
+                .map(main)
+                .collect(),
+        };
+        if user.is_empty() {
+            return found;
+        }
+        let learned = match exact.as_deref() {
+            Some(ids) => user.exact(ids),
+            None => user.abbr(&initials),
+        };
+        for &word in learned.iter().filter(|&&word| fits(user.syllables(word))) {
+            let text = user.text(word);
+            // 主词库里也有的词，换成加过分的代价
+            match found.iter_mut().find(|(found, _)| self.word_text(user, *found) == text) {
+                Some(slot) => *slot = (Word::User(word), user.cost(word)),
+                None => found.push((Word::User(word), user.cost(word))),
             }
         }
+        found.sort_by(|a, b| a.1.total_cmp(&b.1));
+        found.truncate(limit);
         found
     }
+
+    fn word_text<'a>(&'a self, user: &'a UserDict, word: Word) -> &'a str {
+        match word {
+            Word::Main(entry) => self.dict.text(entry),
+            Word::User(learned) => user.text(learned),
+        }
+    }
+
+    fn word_syllables<'a>(&'a self, user: &'a UserDict, word: Word) -> &'a [SylId] {
+        match word {
+            Word::Main(entry) => self.dict.syllables(entry),
+            Word::User(learned) => user.syllables(learned),
+        }
+    }
+}
+
+/// 纠错得来的词不用用户词：用户词只该让照着打的读法更占优。
+fn span_user<'a>(span: &Span, user: &'a UserDict) -> &'a UserDict {
+    if span.segs.iter().any(|seg| seg.fixed.is_some()) { &NO_USER_WORDS } else { user }
 }
 
 /// 接上一段拼音：前面已经是音节的话，先加一个分隔符。
@@ -706,6 +777,47 @@ mod tests {
 
     fn texts(conversion: &Conversion) -> Vec<&str> {
         conversion.candidates.iter().map(|c| c.text.as_str()).collect()
+    }
+
+    fn syllables(engine: &Engine, pinyin: &str) -> Vec<SylId> {
+        pinyin.split(' ').map(|name| engine.dictionary().table().exact(name).unwrap()).collect()
+    }
+
+    #[test]
+    fn often_picked_words_move_up() {
+        let engine = Engine::new(Dictionary::from_rime_sources(&[
+            "几\tji\t900\n机\tji\t800\n鸡\tji\t700\n记\tji\t600\n姬\tji\t500\n",
+        ]));
+        assert_eq!(texts(&engine.convert("ji")), ["几", "机", "鸡", "记", "姬"]);
+        let mut user = UserDict::default();
+        for _ in 0..3 {
+            user.learn(engine.dictionary(), "姬", &syllables(&engine, "ji"), 0);
+        }
+        let c = engine.convert_with("ji", &user);
+        assert_eq!(c.candidates[0].text, "姬", "排第 5 的选了 3 次，升到首位");
+        assert_eq!(c.candidates[0].syllables, syllables(&engine, "ji"));
+        assert_eq!(c.candidates.len(), 5, "换成用户词，不多出一个");
+    }
+
+    #[test]
+    fn learned_phrases_can_be_typed() {
+        let engine = engine();
+        let mut user = UserDict::default();
+        user.learn(engine.dictionary(), "妮鸟", &syllables(&engine, "ni niao"), 0);
+        assert_eq!(engine.convert("niniao").candidates[0].text, "你鸟", "词库里没有「妮」");
+        assert_eq!(engine.convert_with("niniao", &user).candidates[0].text, "妮鸟");
+        assert!(texts(&engine.convert_with("nn", &user)).contains(&"妮鸟"), "简拼也能打出学到的词");
+    }
+
+    #[test]
+    fn learned_words_never_alter_correct_spelling() {
+        let engine = engine();
+        let mut user = UserDict::default();
+        for _ in 0..100 {
+            user.learn(engine.dictionary(), "南宁", &syllables(&engine, "nan ning"), 0);
+            user.learn(engine.dictionary(), "难", &syllables(&engine, "nan"), 0);
+        }
+        assert_eq!(engine.convert_with("naanni", &user).spelling, "na'an'ni", "纠错的读法不用用户词");
     }
 
     #[test]

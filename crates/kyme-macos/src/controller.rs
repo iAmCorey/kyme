@@ -8,7 +8,7 @@ use objc2_app_kit::{NSEvent, NSEventMask, NSMenu, NSMenuItem};
 use objc2_foundation::ns_string;
 use objc2_input_method_kit::IMKInputController;
 
-use crate::{settings_window, state};
+use crate::{client, power, settings_window, state};
 
 define_class!(
     // SAFETY: IMKInputController 没有额外的子类化要求，这个类也没有实现 Drop。
@@ -31,12 +31,14 @@ define_class!(
         }
 
         #[unsafe(method(activateServer:))]
-        fn activate_server(&self, _sender: Option<&AnyObject>) {
+        fn activate_server(&self, sender: Option<&AnyObject>) {
+            log::info!("激活 {}，{}", client::app_name(sender), power::secure_input());
             state::activate();
         }
 
         #[unsafe(method(deactivateServer:))]
         fn deactivate_server(&self, sender: Option<&AnyObject>) {
+            log::info!("失活 {}", client::app_name(sender));
             if let Some(client) = sender {
                 state::finish_composition(client);
             }
@@ -44,6 +46,7 @@ define_class!(
 
         #[unsafe(method(commitComposition:))]
         fn commit_composition(&self, sender: Option<&AnyObject>) {
+            log::info!("App 要求结束输入 {}", client::app_name(sender));
             if let Some(client) = sender {
                 state::finish_composition(client);
             }
@@ -51,6 +54,7 @@ define_class!(
 
         #[unsafe(method_id(menu))]
         fn menu(&self) -> Option<Retained<NSMenu>> {
+            log::info!("打开输入法菜单，{}", power::secure_input());
             input_menu()
         }
 

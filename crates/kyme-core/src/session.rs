@@ -1,11 +1,12 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kyme_pinyin::{Candidate, Conversion, Engine};
+use kyme_pinyin::{Candidate, Conversion, Engine, SylId, UserDict, UserWord};
 use serde::{Deserialize, Serialize};
 
 use crate::punct::Punctuation;
 use crate::settings::Settings;
+use crate::userdict::today;
 
 /// 轻点 Shift 切换中英：按下到松开不能超过这么久，中间也不能按别的键。
 const SHIFT_TAP: Duration = Duration::from_millis(400);
@@ -93,12 +94,18 @@ pub struct Response {
     pub view: View,
     /// 刚切换到的中英状态，平台层据此显示提示。
     pub mode_changed: Option<Mode>,
+    /// 这一下学到了新词，平台层该安排存盘。
+    pub learned: bool,
 }
 
 /// 已经选定、但整串拼音还没打完的部分。
 struct Piece {
     text: String,
     raw: String,
+    /// 读音，学词用。emoji 和原样的字母没有读音。
+    syllables: Vec<SylId>,
+    /// 用户主动选的，不是直接要了首选。
+    chosen: bool,
 }
 
 pub struct Session {
@@ -110,6 +117,10 @@ pub struct Session {
     conversion: Conversion,
     /// `conversion.candidates` 里 emoji 那一个的下标。
     emoji_at: Option<usize>,
+    /// 用户词库。平台层有用户词库文件时才挂上（输入法里有，按键场景和自测都没有），没挂就不学。
+    user: Option<UserDict>,
+    /// 这一下学到了新词，放进下一个 Response。
+    learned: bool,
     highlight: usize,
     punct: Punctuation,
     after_digit: bool,
@@ -126,6 +137,8 @@ impl Session {
             pieces: Vec::new(),
             conversion: Conversion::default(),
             emoji_at: None,
+            user: None,
+            learned: false,
             highlight: 0,
             punct: Punctuation::default(),
             after_digit: false,
@@ -143,6 +156,20 @@ impl Session {
 
     pub fn set_settings(&mut self, settings: Settings) {
         self.settings = settings.normalized();
+    }
+
+    pub fn engine(&self) -> &Engine {
+        &self.engine
+    }
+
+    /// 挂上用户词库，比如刚从文件读出来的词。挂上以后才学词。
+    pub fn set_user_words(&mut self, words: Vec<UserWord>) {
+        self.user = Some(UserDict::new(self.engine.dictionary(), words));
+    }
+
+    /// 学到的词，存盘用。
+    pub fn user_words(&self) -> &[UserWord] {
+        self.user.as_ref().map_or(&[], UserDict::words)
     }
 
     pub fn is_composing(&self) -> bool {
@@ -303,7 +330,7 @@ impl Session {
             Mode::Chinese => Mode::English,
             Mode::English => Mode::Chinese,
         };
-        Response { handled: false, commit, view: View::Idle, mode_changed: Some(self.mode) }
+        Response { handled: false, commit, view: View::Idle, mode_changed: Some(self.mode), learned: false }
     }
 
     fn page_size(&self) -> usize {
@@ -324,9 +351,11 @@ impl Session {
             return self.handled(None);
         };
         let consumed = candidate.consumed.min(self.input.len());
-        self.pieces.push(Piece { text: candidate.text, raw: self.input[..consumed].to_string() });
+        let raw = self.input[..consumed].to_string();
+        self.pieces.push(Piece { text: candidate.text, raw, syllables: candidate.syllables, chosen: index != 0 });
         self.input = self.input[consumed..].trim_start_matches('\'').to_string();
         if self.input.is_empty() {
+            self.learn();
             let text = self.take_raw();
             self.handled(Some(text))
         } else {
@@ -337,9 +366,12 @@ impl Session {
 
     /// 已选部分 + 当前首选；首选没覆盖全部拼音时，剩下的原样保留。
     fn take_best(&mut self) -> String {
-        match self.conversion.candidates.first() {
+        match self.conversion.candidates.first().cloned() {
             Some(first) if first.consumed >= self.input.len() => {
-                let text = self.selected() + &first.text;
+                let raw = std::mem::take(&mut self.input);
+                self.pieces.push(Piece { text: first.text, raw, syllables: first.syllables, chosen: false });
+                self.learn();
+                let text = self.selected();
                 self.clear();
                 text
             }
@@ -347,7 +379,28 @@ impl Session {
         }
     }
 
-    /// 已选部分 + 原始拼音（去掉分隔符）。
+    /// 上屏前记下这次选了什么：主动选的词加分；分几段选出来、其中有主动选的，整个记成一个新词
+    /// （先选「你」再选「好」）。emoji 和原样的字母没有读音，不记；回车、Shift 上屏的也不走这里。
+    fn learn(&mut self) {
+        if !self.settings.input.learn {
+            return;
+        }
+        let Some(user) = &mut self.user else { return };
+        let day = today();
+        let dict = self.engine.dictionary();
+        for piece in self.pieces.iter().filter(|piece| piece.chosen) {
+            self.learned |= user.learn(dict, &piece.text, &piece.syllables, day);
+        }
+        let phrase = self.pieces.len() >= 2
+            && self.pieces.iter().any(|piece| piece.chosen)
+            && self.pieces.iter().all(|piece| !piece.syllables.is_empty());
+        if phrase {
+            let text: String = self.pieces.iter().map(|piece| piece.text.as_str()).collect();
+            let syllables: Vec<SylId> = self.pieces.iter().flat_map(|piece| piece.syllables.iter().copied()).collect();
+            self.learned |= user.learn(dict, &text, &syllables, day);
+        }
+    }
+
     fn take_raw(&mut self) -> String {
         let text = self.selected() + &self.input.replace('\'', "");
         self.clear();
@@ -382,7 +435,10 @@ impl Session {
     }
 
     fn refresh(&mut self) {
-        self.conversion = self.engine.convert(&self.input);
+        self.conversion = match &self.user {
+            Some(user) if self.settings.input.learn => self.engine.convert_with(&self.input, user),
+            _ => self.engine.convert(&self.input),
+        };
         self.emoji_at = if self.settings.input.emoji { self.add_emoji() } else { None };
         self.highlight = 0;
     }
@@ -396,7 +452,7 @@ impl Session {
         let candidates = &self.conversion.candidates;
         let text =
             candidates.iter().take(slot).filter(|c| c.consumed == whole).find_map(|c| emoji.get(&c.text).first())?;
-        let candidate = Candidate { text: text.clone(), consumed: whole };
+        let candidate = Candidate { text: text.clone(), consumed: whole, syllables: Vec::new() };
         let at = slot.min(candidates.len());
         self.conversion.candidates.insert(at, candidate);
         Some(at)
@@ -410,12 +466,13 @@ impl Session {
         self.highlight = 0;
     }
 
-    fn handled(&self, commit: Option<String>) -> Response {
-        Response { handled: true, commit, view: self.view(), mode_changed: None }
+    fn handled(&mut self, commit: Option<String>) -> Response {
+        let learned = std::mem::take(&mut self.learned);
+        Response { handled: true, commit, view: self.view(), mode_changed: None, learned }
     }
 
     fn pass(&self) -> Response {
-        Response { handled: false, commit: None, view: self.view(), mode_changed: None }
+        Response { handled: false, commit: None, view: self.view(), mode_changed: None, learned: false }
     }
 }
 
@@ -453,6 +510,68 @@ mod tests {
     fn tap_shift(s: &mut Session) -> Response {
         press(s, Key::ShiftDown);
         press(s, Key::ShiftUp)
+    }
+
+    fn candidates(s: &Session) -> Vec<String> {
+        match s.view() {
+            View::Composing { panel, .. } => panel.candidates,
+            View::Idle => Vec::new(),
+        }
+    }
+
+    /// 按数字键选第一页里的 `text`。
+    fn pick_text(s: &mut Session, text: &str) -> Response {
+        let at = candidates(s).iter().position(|c| c == text).expect("第一页里有这个候选");
+        press(s, Key::Char(char::from(SELECT_KEYS.as_bytes()[at])))
+    }
+
+    /// 挂上一个空的用户词库，开始学词。
+    fn learning_session() -> Session {
+        let mut s = session();
+        s.set_user_words(Vec::new());
+        s
+    }
+
+    #[test]
+    fn often_picked_words_move_up() {
+        let mut s = learning_session();
+        type_str(&mut s, "ni");
+        assert_eq!(candidates(&s)[..3], ["你", "拟", "泥"]);
+        press(&mut s, Key::Escape);
+        // 「泥」的词频只有「你」的 1/20，主动选 3 次后排到首位
+        for _ in 0..3 {
+            type_str(&mut s, "ni");
+            let r = pick_text(&mut s, "泥");
+            assert_eq!(r.commit.as_deref(), Some("泥"));
+            assert!(r.learned, "学到了就告诉平台层，好安排存盘");
+        }
+        type_str(&mut s, "ni");
+        assert_eq!(candidates(&s)[0], "泥");
+    }
+
+    #[test]
+    fn pieces_picked_one_by_one_become_a_word() {
+        let mut s = learning_session();
+        type_str(&mut s, "nihao");
+        pick_text(&mut s, "拟");
+        assert_eq!(press(&mut s, Key::Space).commit.as_deref(), Some("拟好"));
+        type_str(&mut s, "nihao");
+        assert!(candidates(&s).iter().any(|c| c == "拟好"));
+    }
+
+    #[test]
+    fn nothing_is_learned_without_a_user_dict_or_when_turned_off() {
+        let mut s = session();
+        type_str(&mut s, "ni");
+        assert!(!pick_text(&mut s, "泥").learned, "没挂用户词库就不学");
+
+        let mut s = learning_session();
+        let mut settings = Settings::default();
+        settings.input.learn = false;
+        s.set_settings(settings);
+        type_str(&mut s, "ni");
+        assert!(!pick_text(&mut s, "泥").learned);
+        assert!(s.user_words().is_empty());
     }
 
     #[test]

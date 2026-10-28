@@ -11,6 +11,7 @@ use std::time::SystemTime;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use toml_edit::{DocumentMut, Item, Value};
 
+use crate::disk;
 use crate::session::SELECT_KEYS;
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
@@ -30,11 +31,13 @@ pub struct InputSettings {
     pub inline_pinyin: bool,
     /// 候选第一页最后一格放一个 emoji，取自第一页里和整串拼音对得上的词。
     pub emoji: bool,
+    /// 记住选过的词：常选的往前排，分几次选出来的词组记成新词。存在本机的 userdict.tsv。
+    pub learn: bool,
 }
 
 impl Default for InputSettings {
     fn default() -> Self {
-        InputSettings { page_size: 7, inline_pinyin: true, emoji: true }
+        InputSettings { page_size: 7, inline_pinyin: true, emoji: true, learn: true }
     }
 }
 
@@ -107,6 +110,8 @@ page_size = 7
 inline_pinyin = true
 # 候选里带 emoji：第一页最后一格放一个和打的拼音对得上的 emoji
 emoji = true
+# 记住选过的词：常选的往前排，分几次选出来的词组记成新词。只存在本机的 userdict.tsv
+learn = true
 
 [appearance]
 # 候选字号（pt，12–36），其余文字和间距按比例缩放
@@ -140,7 +145,7 @@ impl SettingsFile {
         {
             return Some(Err(format!("写不了设置文件：{err}")));
         }
-        let modified = fs::metadata(&self.path).and_then(|m| m.modified()).ok();
+        let modified = disk::modified(&self.path);
         if modified.is_some() && modified == self.modified {
             return None;
         }
@@ -174,27 +179,14 @@ impl SettingsFile {
             }
         }
 
-        // 先写到旁边的临时文件再换上，输入法进程不会读到写了一半的文件
-        let tmp = self.path.with_extension("toml.tmp");
-        self.create_dir()
-            .and_then(|()| fs::write(&tmp, doc.to_string()))
-            .and_then(|()| fs::rename(&tmp, &self.path))
-            .map_err(|err| format!("写不了设置文件：{err}"))?;
+        disk::write_atomic(&self.path, &doc.to_string(), false).map_err(|err| format!("写不了设置文件：{err}"))?;
         // 自己写的不算改过，下次 reload 不重读
-        self.modified = fs::metadata(&self.path).and_then(|m| m.modified()).ok();
+        self.modified = disk::modified(&self.path);
         Ok(())
     }
 
     fn write_template(&self) -> io::Result<()> {
-        self.create_dir()?;
-        fs::write(&self.path, SETTINGS_TEMPLATE)
-    }
-
-    fn create_dir(&self) -> io::Result<()> {
-        match self.path.parent() {
-            Some(dir) => fs::create_dir_all(dir),
-            None => Ok(()),
-        }
+        disk::write_atomic(&self.path, SETTINGS_TEMPLATE, false)
     }
 }
 

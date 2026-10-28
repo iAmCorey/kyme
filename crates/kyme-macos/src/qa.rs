@@ -115,11 +115,11 @@ thread_local! {
 
 /// 启动自测模式，直到标准输入关闭。
 pub fn run() {
-    // 用临时的设置文件：结果不能依赖你自己的设置
+    // 用临时的设置文件：结果不能依赖你自己的设置。不挂用户词库，也就不学词
     let settings = std::env::temp_dir().join(format!("kyme-qa-{}.toml", std::process::id()));
     let loading = crate::load_engine_in_background();
     Application::new().run(move |cx| {
-        crate::boot(cx, loading, SettingsFile::new(settings.clone()));
+        crate::boot(cx, loading, SettingsFile::new(settings.clone()), None);
         thread::spawn(move || serve(settings));
     });
 }

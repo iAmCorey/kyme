@@ -22,8 +22,8 @@ use crate::{Context, bundle, util};
 
 /// 还没选定任何字时，输入框里放的占位符（只在拼音不显示在输入框里时用到），和 kyme-macos 的 state.rs 一致。
 const PLACEHOLDER: &str = "\u{3000}";
-/// 中英提示显示多久（state.rs 里是 700ms）。等它消失了再检查候选窗有没有收起来。
-const HINT: Duration = Duration::from_millis(800);
+/// 中英提示显示多久（state.rs 里是 1500ms）。等它消失了再检查候选窗有没有收起来。
+const HINT: Duration = Duration::from_millis(1600);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 发给 `Kyme --qa` 的指令，和 crates/kyme-macos/src/qa.rs 里的一致。
@@ -58,7 +58,7 @@ fn test(ctx: &mut Context) -> Result<Outcome, String> {
         .map_err(|out| format!("组装 Kyme.app 失败：{}", util::tail(&out, 3).join(" / ")))?;
     let mut kyme = Kyme::spawn(&ctx.root.join(bundle::APP).join("Contents/MacOS/Kyme"))?;
 
-    // 自测模式用默认设置，参照也一样
+    // 自测模式用默认设置、不挂用户词库，参照也一样
     let mut oracle = Session::new(loaded.engine);
     let mut failures = Vec::new();
     let mut timings = Vec::new();

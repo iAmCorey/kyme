@@ -1,9 +1,20 @@
 //! 对 IMK 客户端（正在输入的那个 App）的调用。
 
-use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
+use objc2::{msg_send, sel};
 use objc2_foundation::{NSNotFound, NSRange, NSRect, NSString};
+
+/// 客户端 App 的 bundle ID，写诊断日志用。拿不到时是「未知 App」。
+pub fn app_name(client: Option<&AnyObject>) -> String {
+    let Some(client) = client else { return "未知 App".into() };
+    // SAFETY: respondsToSelector: 是 NSObject 协议的方法；IMKTextInput 的 bundleIdentifier 返回 NSString 或 nil
+    let id: Option<Retained<NSString>> = unsafe {
+        let responds: bool = msg_send![client, respondsToSelector: sel!(bundleIdentifier)];
+        if responds { msg_send![client, bundleIdentifier] } else { None }
+    };
+    id.map_or_else(|| "未知 App".into(), |id| id.to_string())
+}
 
 fn no_replacement() -> NSRange {
     NSRange::new(NSNotFound as usize, 0)

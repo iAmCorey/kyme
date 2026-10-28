@@ -11,6 +11,7 @@ mod controller;
 mod install;
 mod logger;
 mod panel;
+mod power;
 mod qa;
 mod settings_window;
 mod state;
@@ -21,8 +22,8 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use gpui::{App, Application};
-use kyme_core::SettingsFile;
 use kyme_core::pinyin::{Dictionary, Engine};
+use kyme_core::{SettingsFile, UserDictFile};
 use objc2::rc::Retained;
 use objc2::{AnyThread, MainThreadMarker};
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
@@ -61,7 +62,9 @@ fn main() {
     // 输入法在跑的时候再打开一次 Kyme.app（启动台、Spotlight、访达）：打开设置
     app.on_reopen(|_| settings_window::open());
     app.run(move |cx| {
-        boot(cx, loading, SettingsFile::new(settings_path()));
+        let userdict = UserDictFile::beside(&settings_path());
+        boot(cx, loading, SettingsFile::new(settings_path()), Some(userdict));
+        power::watch();
         match start_server() {
             // IMKServer 要在整个进程生命周期里一直存在
             Some(server) => {
@@ -92,7 +95,7 @@ fn load_engine_in_background() -> JoinHandle<Engine> {
 }
 
 /// 输入法和自测模式共用的启动：设成后台 App，建候选窗，等词库读完，装好全局状态。
-fn boot(cx: &mut App, loading: JoinHandle<Engine>, settings: SettingsFile) {
+fn boot(cx: &mut App, loading: JoinHandle<Engine>, settings: SettingsFile, userdict: Option<UserDictFile>) {
     let mtm = MainThreadMarker::new().expect("GPUI 的启动回调在主线程");
     // GPUI 启动时把激活策略设成 Regular（会出现 Dock 图标），输入法要改回来
     let _ = NSApplication::sharedApplication(mtm).setActivationPolicy(NSApplicationActivationPolicy::Accessory);
@@ -102,7 +105,7 @@ fn boot(cx: &mut App, loading: JoinHandle<Engine>, settings: SettingsFile) {
     // 构建词库时的临时内存是在另一个线程分配的，释放后 malloc 不会主动还给系统
     // SAFETY: 传 NULL 表示处理全部 malloc zone，0 表示尽量多还
     unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
-    state::install(state::AppState::new(engine, panel, cx.to_async(), settings));
+    state::install(state::AppState::new(engine, panel, cx.to_async(), settings, userdict));
 }
 
 unsafe extern "C" {

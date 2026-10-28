@@ -1,9 +1,10 @@
 //! 开发用的命令行工具，目前只有一个命令：
 //!
-//! `cargo xtask qa`：发版前的整套检查。各项查什么、怎么加用例、发版流程见 docs/QA.md。
+//! `cargo xtask qa`：检查。平时按改动挑着跑，发版时跑全部。各项查什么、怎么加用例、发版流程见 docs/QA.md。
 
 #[cfg(target_os = "macos")]
 mod bundle;
+mod changes;
 mod checks;
 mod eval;
 mod gates;
@@ -26,11 +27,12 @@ use crate::gates::Gates;
 use crate::report::{Outcome, Report, Status};
 
 const USAGE: &str = "\
-用法：cargo xtask qa [--manual] [--release] [--only 检查,...]
+用法：cargo xtask qa [--all] [--manual] [--release] [--only 检查,...]
 
-  不带参数   自动检查：格式、clippy、单元测试、评测、按键场景、安装包、macOS 接入层。不动输入法设置，也不占屏幕
+  不带参数   按改动挑检查：只跑和还没推送的改动有关的那几项
+  --all      全部自动检查：格式、clippy、单元测试、评测、按键场景、安装包、macOS 接入层。不动输入法设置，也不占屏幕
   --manual   再逐项过一遍人工检查清单（qa/manual.toml）
-  --release  发版用：以上全部，外加发版要求（LICENSE、代码已提交）
+  --release  发版用：全部自动检查，外加人工检查和发版要求（LICENSE、代码已提交）
   --only     只跑列出的检查，比如 --only eval,scenarios
 
 检查：fmt clippy test eval scenarios bundle macos release manual";
@@ -46,7 +48,7 @@ fn main() -> ExitCode {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Check {
     Fmt,
     Clippy,
@@ -103,6 +105,7 @@ impl Check {
 }
 
 struct Options {
+    all: bool,
     manual: bool,
     release: bool,
     only: Option<Vec<Check>>,
@@ -110,10 +113,11 @@ struct Options {
 
 impl Options {
     fn parse(args: &[String]) -> Result<Options, String> {
-        let mut options = Options { manual: false, release: false, only: None };
+        let mut options = Options { all: false, manual: false, release: false, only: None };
         let mut args = args.iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
+                "--all" => options.all = true,
                 "--manual" => options.manual = true,
                 "--release" => options.release = true,
                 "--only" => {
@@ -130,7 +134,9 @@ impl Options {
         Ok(options)
     }
 
-    fn checks(&self) -> Vec<Check> {
+    /// `changed`：按改动挑出来的检查，没指定 --only、--all、--release 时用。
+    fn checks(&self, changed: impl FnOnce() -> Vec<Check>) -> Vec<Check> {
+        let automatic = if self.only.is_some() || self.all || self.release { Check::ALL.to_vec() } else { changed() };
         Check::ALL
             .into_iter()
             .filter(|check| match &self.only {
@@ -138,7 +144,7 @@ impl Options {
                 None => match check {
                     Check::Release => self.release,
                     Check::Manual => self.manual || self.release,
-                    _ => true,
+                    _ => automatic.contains(check),
                 },
             })
             .collect()
@@ -194,8 +200,20 @@ fn qa(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let checks = options.checks();
+    let checks = options.checks(|| changes::checks(&changes::files(&root)));
+    if checks.is_empty() {
+        println!("还没推送的改动里没有要检查的（只改了文档之类），不用跑。全部跑用 --all");
+        return ExitCode::SUCCESS;
+    }
     let scope: Vec<&str> = checks.iter().map(|check| check.title()).collect();
+    let skipped: Vec<&str> = Check::ALL
+        .into_iter()
+        .filter(|check| !matches!(check, Check::Release | Check::Manual) && !checks.contains(check))
+        .map(Check::title)
+        .collect();
+    if !skipped.is_empty() && options.only.is_none() {
+        println!("按改动挑了 {} 项，跳过和改动无关的：{}。全部跑用 --all\n", checks.len(), skipped.join("、"));
+    }
     let mut report = Report::new(report::header(&root, &scope.join("、")));
     let mut ctx = Context { root, gates, engine: None };
 

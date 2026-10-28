@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+block2 = "0.6"
 core-foundation = "0.10"
 core-graphics = "0.24"
 dispatch2 = "0.3.1"

@@ -10,7 +10,7 @@ use std::{fmt, fs, io};
 use crate::syllable::{SylId, SyllableTable};
 
 /// 全拼索引最多支持 6 个音节，每个音节 id + 1 占 10 bit。
-const EXACT_SLOTS: usize = 6;
+pub(crate) const EXACT_SLOTS: usize = 6;
 const EXACT_BITS: u32 = 10;
 /// 简拼索引最多支持 12 个音节，每个首字母（a–z 记作 1–26）占 5 bit。
 const ABBR_SLOTS: usize = 12;
@@ -32,9 +32,8 @@ pub struct Dictionary {
     /// 按全拼 key 排序，同一个 key 内按词频从高到低。
     entries: Vec<Entry>,
     exact_keys: Vec<u64>,
-    /// 简拼索引：两列平行数组，按 key 排序，同一个 key 内按词频从高到低。
-    abbr_keys: Vec<u64>,
-    abbr_entries: Vec<u32>,
+    /// 简拼索引，同一个 key 内按词频从高到低。
+    abbr: KeyIndex,
     /// 超过 6 个音节的词，前 6 个音节的全拼 key（有序、去重）。全拼索引放不下这些词，
     /// 判断「有没有以这几个音节开头的词」时要一起查，不然它们会在切分时被提前剪掉。
     long_prefixes: Vec<u64>,
@@ -107,7 +106,7 @@ fn prefix_range(prefix: u64, len: usize, bits: u32, slots: usize) -> (u64, u64) 
     (prefix, prefix + (1 << (bits * (slots - len) as u32)))
 }
 
-fn exact_key(ids: &[SylId]) -> Option<u64> {
+pub(crate) fn exact_key(ids: &[SylId]) -> Option<u64> {
     (ids.len() <= EXACT_SLOTS).then(|| pack(ids.iter().map(|&id| u64::from(id) + 1), EXACT_BITS, EXACT_SLOTS))
 }
 
@@ -123,6 +122,62 @@ fn any_in(sorted: &[u64], (lo, hi): (u64, u64)) -> bool {
 /// 有序数组里等于 `key` 的那一段。
 fn equal_range(sorted: &[u64], key: u64) -> std::ops::Range<usize> {
     sorted.partition_point(|&k| k < key)..sorted.partition_point(|&k| k <= key)
+}
+
+/// 以这几个音节开头的全拼 key 所在的区间。音节太多、放不下时是 None。
+pub(crate) fn exact_prefix(ids: &[SylId]) -> Option<(u64, u64)> {
+    exact_key(ids).map(|key| prefix_range(key, ids.len(), EXACT_BITS, EXACT_SLOTS))
+}
+
+/// 首字母依次为 `initials` 的简拼 key。
+pub(crate) fn abbr_key_of(initials: &[u8]) -> Option<u64> {
+    abbr_key(initials.iter().copied())
+}
+
+/// 首字母以 `initials` 开头的简拼 key 所在的区间。
+pub(crate) fn abbr_prefix(initials: &[u8]) -> Option<(u64, u64)> {
+    abbr_key_of(initials).map(|key| prefix_range(key, initials.len(), ABBR_BITS, ABBR_SLOTS))
+}
+
+/// 一套有序索引：key 和词的下标两列平行，按 key 排序。查某个 key 下的词、判断有没有以某串开头的 key，
+/// 都是二分查找。主词库的简拼索引和用户词库都用它。
+pub(crate) struct KeyIndex {
+    keys: Vec<u64>,
+    ids: Vec<u32>,
+}
+
+impl KeyIndex {
+    pub(crate) const fn new() -> Self {
+        KeyIndex { keys: Vec::new(), ids: Vec::new() }
+    }
+
+    /// 从已经按 key 排好序的 (key, 下标) 建。
+    fn from_sorted(pairs: impl Iterator<Item = (u64, u32)>) -> Self {
+        let (keys, ids) = pairs.unzip();
+        KeyIndex { keys, ids }
+    }
+
+    pub(crate) fn build(mut pairs: Vec<(u64, u32)>) -> Self {
+        pairs.sort_unstable();
+        Self::from_sorted(pairs.into_iter())
+    }
+
+    /// 插一个词，保持有序。key 是 None（放不下）就不插。
+    pub(crate) fn insert(&mut self, key: Option<u64>, id: u32) {
+        if let Some(key) = key {
+            let at = self.keys.partition_point(|&k| k <= key);
+            self.keys.insert(at, key);
+            self.ids.insert(at, id);
+        }
+    }
+
+    pub(crate) fn get(&self, key: Option<u64>) -> &[u32] {
+        key.map_or(&[], |key| &self.ids[equal_range(&self.keys, key)])
+    }
+
+    pub(crate) fn has_prefix(&self, range: Option<(u64, u64)>) -> bool {
+        range.is_some_and(|range| any_in(&self.keys, range))
+    }
 }
 
 impl Dictionary {
@@ -178,7 +233,7 @@ impl Dictionary {
             })
             .collect();
         abbr.sort_unstable();
-        let (abbr_keys, abbr_entries) = abbr.into_iter().map(|(key, _, i)| (key, i)).unzip();
+        let abbr = KeyIndex::from_sorted(abbr.into_iter().map(|(key, _, i)| (key, i)));
         let mut long_prefixes: Vec<u64> = entries
             .iter()
             .map(ids_of)
@@ -189,17 +244,7 @@ impl Dictionary {
         long_prefixes.dedup();
         let total: f64 = entries.iter().map(|e| f64::from(e.weight) + 1.0).sum();
 
-        Dictionary {
-            table,
-            texts,
-            syls,
-            entries,
-            exact_keys,
-            abbr_keys,
-            abbr_entries,
-            long_prefixes,
-            ln_total: total.max(1.0).ln(),
-        }
+        Dictionary { table, texts, syls, entries, exact_keys, abbr, long_prefixes, ln_total: total.max(1.0).ln() }
     }
 
     pub fn table(&self) -> &SyllableTable {
@@ -226,7 +271,17 @@ impl Dictionary {
 
     /// 一元模型下的代价：-ln(词频 / 总词频)。
     pub fn cost(&self, entry: u32) -> f64 {
-        self.ln_total - (f64::from(self.entries[entry as usize].weight) + 1.0).ln()
+        self.cost_of_weight(f64::from(self.entries[entry as usize].weight))
+    }
+
+    /// 词频为 `weight` 的词的代价。
+    pub(crate) fn cost_of_weight(&self, weight: f64) -> f64 {
+        self.ln_total - (weight + 1.0).ln()
+    }
+
+    /// 读音为 `ids`、文字为 `text` 的词条。
+    pub fn find(&self, text: &str, ids: &[SylId]) -> Option<u32> {
+        self.exact(ids)?.find(|&entry| self.text(entry) == text)
     }
 
     /// 全拼完全一致的词，按词频从高到低。音节太多、全拼索引放不下时返回 None。
@@ -237,22 +292,17 @@ impl Dictionary {
 
     /// 每个音节首字母依次为 `initials` 的词，按词频从高到低。调用方再按完整约束过滤。
     pub fn abbr(&self, initials: &[u8]) -> impl Iterator<Item = u32> + '_ {
-        let range = abbr_key(initials.iter().copied()).map_or(0..0, |key| equal_range(&self.abbr_keys, key));
-        self.abbr_entries[range].iter().copied()
+        self.abbr.get(abbr_key_of(initials)).iter().copied()
     }
 
     /// 有没有以这几个音节开头的词。音节太多、判断不了时返回 true。
     pub fn has_exact_prefix(&self, ids: &[SylId]) -> bool {
-        exact_key(ids).is_none_or(|key| {
-            let range = prefix_range(key, ids.len(), EXACT_BITS, EXACT_SLOTS);
-            any_in(&self.exact_keys, range) || any_in(&self.long_prefixes, range)
-        })
+        exact_prefix(ids).is_none_or(|range| any_in(&self.exact_keys, range) || any_in(&self.long_prefixes, range))
     }
 
     /// 有没有首字母以 `initials` 开头的词。
     pub fn has_abbr_prefix(&self, initials: &[u8]) -> bool {
-        abbr_key(initials.iter().copied())
-            .is_some_and(|key| any_in(&self.abbr_keys, prefix_range(key, initials.len(), ABBR_BITS, ABBR_SLOTS)))
+        self.abbr.has_prefix(abbr_prefix(initials))
     }
 }
 

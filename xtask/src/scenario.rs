@@ -281,7 +281,7 @@ pub fn run(ctx: &mut Context) -> Outcome {
         Ok(scenarios) => scenarios,
         Err(err) => return Outcome::fail(err),
     };
-    // 用默认设置跑，不读你的 settings.toml：场景的期望照默认设置写
+    // 用默认设置跑，不读你的 settings.toml：场景的期望照默认设置写。不挂用户词库，也就不学词
     let mut session = Session::new(loaded.engine);
     let mut failures = Vec::new();
     for scenario in &scenarios {

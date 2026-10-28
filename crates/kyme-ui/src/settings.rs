@@ -10,7 +10,7 @@ use gpui::{
     transparent_black,
 };
 use kyme_core::pinyin::{Dictionary, Emoji, Engine};
-use kyme_core::{FONT_SIZES, Key, Modifiers, PAGE_SIZES, Rgb, Session, Settings, SettingsFile, View};
+use kyme_core::{FONT_SIZES, Key, Modifiers, PAGE_SIZES, Rgb, Session, Settings, SettingsFile, UserDictFile, View};
 
 use crate::{CandidateView, Content, Metrics, Theme, panel_height};
 
@@ -28,9 +28,8 @@ const STAGE_GAP: f32 = 8.0;
 /// 分组的标题，连同上方的留白。
 const HEADER: f32 = 32.0;
 const ROW: f32 = 40.0;
-/// 几组，每组几项。render 里按它们定长，加了一组或一项忘了改这里会编译不过，窗口高度就不会算错。
-const SECTIONS: usize = 2;
-const ROWS: usize = 3;
+/// 每组几项。render 里每组的行按它定长，加了一组或一项忘了改这里会编译不过，窗口高度就不会算错。
+const SECTION_ROWS: [usize; 2] = [4, 3];
 /// 每组卡片上下各一像素的边框。
 const CARD_BORDER: f32 = 2.0;
 const FOOTER: f32 = 48.0;
@@ -67,6 +66,10 @@ pub struct SettingsView {
     /// 预览的输入框里显示的内容。
     marked: String,
     preview: Entity<CandidateView>,
+    /// 用户词库里有几个词。
+    learned_words: usize,
+    /// 已经点过一次「清除」，再点一次才真的清。
+    confirm_clear: bool,
     focus: FocusHandle,
     _subscriptions: [Subscription; 2],
 }
@@ -115,6 +118,8 @@ impl SettingsView {
             engine: Arc::new(engine),
             marked: String::new(),
             preview,
+            learned_words: 0,
+            confirm_clear: false,
             focus,
             _subscriptions: subscriptions,
         };
@@ -124,12 +129,14 @@ impl SettingsView {
 
     /// 按这份设置，窗口内容该多大。预览跟着字号变高，窗口也跟着变；打开窗口前用它定大小。
     pub fn size_for(settings: &Settings) -> Size<Pixels> {
-        let card = ROWS as f32 * ROW + CARD_BORDER;
-        size(px(WIDTH), px(TITLEBAR + stage_height(settings) + SECTIONS as f32 * (HEADER + card) + FOOTER))
+        let sections: f32 = SECTION_ROWS.iter().map(|&rows| HEADER + rows as f32 * ROW + CARD_BORDER).sum();
+        size(px(WIDTH), px(TITLEBAR + stage_height(settings) + sections + FOOTER))
     }
 
     /// 设置文件改过（或者还没读过）就重读。读不了时和输入法一样用默认设置，并显示原因。
+    /// 用户词库是输入法写的，每次都重数一遍有几个词。
     fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.learned_words = self.userdict().count();
         let (settings, error) = match self.file.reload() {
             None => return,
             Some(Ok(settings)) => (settings, None),
@@ -144,6 +151,7 @@ impl SettingsView {
     fn change(&mut self, edit: &dyn Fn(&mut Settings), window: &mut Window, cx: &mut Context<Self>) {
         // 文件可能刚在别处改过，以文件里的为准再改
         self.reload(window, cx);
+        self.confirm_clear = false;
         let mut next = self.settings.clone();
         edit(&mut next);
         let next = next.normalized();
@@ -210,6 +218,44 @@ impl SettingsView {
                     .shadow(shadow(p.shadow, 2.0, 10.0))
                     .child(self.preview.clone()),
             )
+    }
+
+    fn userdict(&self) -> UserDictFile {
+        UserDictFile::beside(self.file.path())
+    }
+
+    /// 「记住选过的词」一行的右边：学了几个词、清除，和开关。清除要点两次，免得手滑。
+    fn learn_control(&self, p: &Palette, cx: &mut Context<Self>) -> Div {
+        let clear = (self.learned_words > 0).then(|| {
+            let (label, color) = if self.confirm_clear {
+                ("再点一次清除".to_string(), p.error)
+            } else {
+                (format!("{} 个词 · 清除", self.learned_words), p.theme.secondary)
+            };
+            div()
+                .id("clear-learned")
+                .text_size(px(12.0))
+                .text_color(color)
+                .cursor_pointer()
+                .hover(|style| style.underline())
+                .child(label)
+                .on_click(cx.listener(|view, _: &ClickEvent, _, cx| view.clear_learned(cx)))
+        });
+        div().flex().items_center().gap(px(12.0)).children(clear).child(
+            switch(p, "learn", self.settings.input.learn).on_click(on_change(cx, |s| s.input.learn = !s.input.learn)),
+        )
+    }
+
+    /// 清除学到的词：删掉用户词库的文件，输入法下次切换输入框时发现文件没了，就清空。
+    fn clear_learned(&mut self, cx: &mut Context<Self>) {
+        if self.confirm_clear {
+            match self.userdict().clear() {
+                Ok(()) => self.learned_words = 0,
+                Err(err) => self.error = Some(format!("清除不了学到的词：{err}")),
+            }
+        }
+        self.confirm_clear = !self.confirm_clear;
+        cx.notify();
     }
 
     fn page_picker(&self, p: &Palette, cx: &mut Context<Self>) -> Div {
@@ -333,35 +379,30 @@ impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::new(window.appearance(), self.settings.appearance.highlight_color);
         let input = &self.settings.input;
-        let sections: [(&str, [Div; ROWS]); SECTIONS] = [
-            (
-                "输入",
-                [
-                    row(&p, true, "每页候选", self.page_picker(&p, cx)),
-                    row(
-                        &p,
-                        false,
-                        "拼音显示在输入框里",
-                        switch(&p, "inline", input.inline_pinyin)
-                            .on_click(on_change(cx, |s| s.input.inline_pinyin = !s.input.inline_pinyin)),
-                    ),
-                    row(
-                        &p,
-                        false,
-                        "候选带 emoji",
-                        switch(&p, "emoji", input.emoji).on_click(on_change(cx, |s| s.input.emoji = !s.input.emoji)),
-                    ),
-                ],
+        let input_rows: [Div; SECTION_ROWS[0]] = [
+            row(&p, true, "每页候选", self.page_picker(&p, cx)),
+            row(
+                &p,
+                false,
+                "拼音显示在输入框里",
+                switch(&p, "inline", input.inline_pinyin)
+                    .on_click(on_change(cx, |s| s.input.inline_pinyin = !s.input.inline_pinyin)),
             ),
-            (
-                "外观",
-                [
-                    row(&p, true, "字号", self.stepper(&p, cx)),
-                    row(&p, false, "字体", self.font_picker(&p, cx)),
-                    row(&p, false, "高亮色", self.color_picker(cx)),
-                ],
+            row(
+                &p,
+                false,
+                "候选带 emoji",
+                switch(&p, "emoji", input.emoji).on_click(on_change(cx, |s| s.input.emoji = !s.input.emoji)),
             ),
+            row(&p, false, "记住选过的词", self.learn_control(&p, cx)),
         ];
+        let appearance_rows: [Div; SECTION_ROWS[1]] = [
+            row(&p, true, "字号", self.stepper(&p, cx)),
+            row(&p, false, "字体", self.font_picker(&p, cx)),
+            row(&p, false, "高亮色", self.color_picker(cx)),
+        ];
+        let sections: [Div; SECTION_ROWS.len()] =
+            [section(&p, "输入", input_rows), section(&p, "外观", appearance_rows)];
         div()
             .track_focus(&self.focus)
             .size_full()
@@ -381,7 +422,7 @@ impl Render for SettingsView {
                     .child("Kyme 设置"),
             )
             .child(self.stage(&p, window, cx))
-            .children(sections.map(|(title, rows)| section(&p, title, rows)))
+            .children(sections)
             .child(self.footer(&p))
     }
 }
@@ -401,7 +442,7 @@ fn on_change(
 }
 
 /// 一组设置：小标题，下面一张卡片。
-fn section(p: &Palette, title: &'static str, rows: [Div; ROWS]) -> Div {
+fn section<const ROWS: usize>(p: &Palette, title: &'static str, rows: [Div; ROWS]) -> Div {
     div()
         .mx(px(MARGIN))
         .flex()

@@ -8,8 +8,10 @@ mod dict;
 mod emoji;
 mod engine;
 mod syllable;
+mod user;
 
 pub use dict::{Dictionary, LoadError};
 pub use emoji::Emoji;
 pub use engine::{Candidate, Conversion, Engine};
 pub use syllable::{SylId, SyllableTable};
+pub use user::{MAX_WORDS, UserDict, UserWord};
