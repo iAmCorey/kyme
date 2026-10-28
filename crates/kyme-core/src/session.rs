@@ -376,41 +376,49 @@ impl Session {
     }
 
     /// 现在要不要问 AI，问什么。只在第一页、高亮还在首选、首选是照着打的整句时问：翻过页、挪过高亮，说明正在挑，
-    /// 不该再动候选；首选用了纠错的话，给 AI 挑的整句（不纠错）就对不上了。
-    pub fn ai_query(&self) -> Option<AiQuery> {
-        if self.input.is_empty() || self.highlight != 0 || self.ai.is_some() {
-            return None;
+    /// 不该再动候选；首选用了纠错的话，给 AI 挑的整句（不纠错）就对不上了。不问时返回原因，写日志用，不带打的字。
+    pub fn ai_query(&self) -> Result<AiQuery, &'static str> {
+        if self.input.is_empty() {
+            return Err("没在输入");
         }
-        let first = self.conversion.candidates.first()?;
+        if self.highlight != 0 {
+            return Err("挪过高亮");
+        }
+        if self.ai.is_some() {
+            return Err("已经标了 ✨");
+        }
+        let first = self.conversion.candidates.first().ok_or("没有候选")?;
         let mut sentences = self.engine.sentences(&self.input, self.learned_words(), AI_SENTENCES);
-        // 首选放在第一个，AI 挑它就是不用换。首选不在里面（用了纠错）就不问
-        let at = sentences.iter().position(|sentence| sentence.text == first.text)?;
+        // 首选放在第一个，AI 挑它就是不用换
+        let at = sentences.iter().position(|sentence| sentence.text == first.text).ok_or("首选用了纠错")?;
         let first = sentences.remove(at);
         sentences.insert(0, first);
         if sentences.len() < 2 {
-            return None;
+            return Err("只有一句");
         }
-        Some(AiQuery { generation: self.generation, selected: self.selected(), pinyin: self.input.clone(), sentences })
+        Ok(AiQuery { generation: self.generation, selected: self.selected(), pinyin: self.input.clone(), sentences })
     }
 
-    /// AI 在 `query` 的整句里挑了第 `pick` 句：放到第一个、标上 ✨，原来的首选排第二。输入变了（`query` 过时）、
-    /// 已经在挑别的候选、挑的就是首选，都不动。`now` 是放上去的时间，`AI_GUARD` 从它算起。返回候选变没变。
+    /// AI 在 `query` 的整句里挑了第 `pick` 句：放到第一个、标上 ✨，原来的首选排第二。挑的就是首选的话只标 ✨，
+    /// 看得出 AI 看过了。输入变了（`query` 过时）、已经在挑别的候选，都不动。`now` 是标上的时间，`AI_GUARD`
+    /// 从它算起。返回候选窗要不要重画。
     pub fn offer_ai(&mut self, query: &AiQuery, pick: usize, now: Instant) -> bool {
         if query.generation != self.generation || self.highlight != 0 || self.ai.is_some() {
             return false;
         }
         let Some(sentence) = query.sentences.get(pick) else { return false };
-        if self.conversion.candidates.first().is_none_or(|first| first.text == sentence.text) {
-            return false;
-        }
+        let Some(first) = self.conversion.candidates.first() else { return false };
+        let moved = first.text != sentence.text;
         let before = AiOffer { since: now, candidates: self.conversion.candidates.clone(), emoji_at: self.emoji_at };
-        // emoji 要留在第一页最后一格：先拿掉，放好 ✨ 再按新的首选重新放
-        if let Some(at) = self.emoji_at.take() {
-            self.conversion.candidates.remove(at);
+        if moved {
+            // emoji 要留在第一页最后一格：先拿掉，放好 ✨ 再按新的首选重新放
+            if let Some(at) = self.emoji_at.take() {
+                self.conversion.candidates.remove(at);
+            }
+            self.conversion.candidates.retain(|candidate| candidate.text != sentence.text);
+            self.conversion.candidates.insert(0, sentence.clone());
+            self.emoji_at = self.add_emoji();
         }
-        self.conversion.candidates.retain(|candidate| candidate.text != sentence.text);
-        self.conversion.candidates.insert(0, sentence.clone());
-        self.emoji_at = self.add_emoji();
         self.ai = Some(before);
         true
     }
@@ -709,8 +717,22 @@ mod tests {
         assert_eq!(panel.ai, Some(0));
         assert_eq!(panel.emoji, Some(panel.candidates.len() - 1), "emoji 还在最后一格");
         assert_eq!(panel.candidates.last().map(String::as_str), Some("🤢"), "按新的首选配 emoji");
-        assert_eq!(s.ai_query(), None, "放了 ✨ 就不再问");
+        assert_eq!(s.ai_query().err(), Some("已经标了 ✨"), "放了 ✨ 就不再问");
         assert_eq!(press(&mut s, Key::Space).commit.as_deref(), Some("好难喝"));
+    }
+
+    #[test]
+    fn an_ai_pick_of_the_first_only_marks_it() {
+        let mut s = ai_session();
+        type_str(&mut s, "haonanhe");
+        let View::Composing { panel: before, .. } = s.view() else { panic!("还在输入") };
+        let query = s.ai_query().unwrap();
+        assert!(s.offer_ai(&query, 0, Instant::now()), "标了 ✨，要重画");
+        let View::Composing { panel, .. } = s.view() else { panic!("还在输入") };
+        assert_eq!(panel.candidates, before.candidates, "候选不动");
+        assert_eq!(panel.ai, Some(0));
+        assert_eq!(s.ai_query().err(), Some("已经标了 ✨"), "看过了就不再问");
+        assert_eq!(press(&mut s, Key::Space).commit.as_deref(), Some("好难和"));
     }
 
     #[test]
@@ -723,16 +745,15 @@ mod tests {
     }
 
     #[test]
-    fn stale_or_pointless_ai_answers_are_ignored() {
+    fn stale_ai_answers_are_ignored() {
         let mut s = ai_session();
         type_str(&mut s, "haonanhe");
         let query = s.ai_query().unwrap();
-        assert!(!s.offer_ai(&query, 0, Instant::now()), "挑的就是首选");
         type_str(&mut s, "h");
         assert!(!s.offer_ai(&query, pick(&query, "好难喝"), Instant::now()), "输入已经变了");
         press(&mut s, Key::Backspace);
         press(&mut s, Key::Right);
-        assert_eq!(s.ai_query(), None, "挪过高亮，正在挑，就不问了");
+        assert_eq!(s.ai_query().err(), Some("挪过高亮"), "正在挑，就不问了");
     }
 
     #[test]

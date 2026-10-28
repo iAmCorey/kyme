@@ -2,7 +2,7 @@
 
 开源、AI 原生的中文输入法，先做 macOS。Rust + [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui)。
 
-早期版本，AI 功能还没做。路线图见 [docs/PLAN.md](docs/PLAN.md)，引擎设计见 [docs/ENGINE.md](docs/ENGINE.md)，更新记录见 [CHANGELOG.md](CHANGELOG.md)。
+早期版本。路线图见 [docs/PLAN.md](docs/PLAN.md)，引擎设计见 [docs/ENGINE.md](docs/ENGINE.md)，更新记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 功能
 
@@ -12,7 +12,7 @@
 - 候选带 emoji（`haha` → 😄）
 - 记住选过的词：常选的往前排，只存在本机
 - 自定义词库；导入外部词库（搜狗细胞词库、Rime、文本）
-- AI 预测选词（默认关）：停顿时请模型按光标前的文字挑首选，标 ✨；可选 TypeSafe、Anthropic、OpenAI、DeepSeek、通义千问、Kimi、智谱、OpenRouter，或自定义接口
+- AI 预测选词（默认关）：停顿时请模型按光标前的文字挑首选，AI 挑的那句标 ✨；可选 TypeSafe、Anthropic、OpenAI、DeepSeek、通义千问、Kimi、智谱、OpenRouter，或自定义接口
 - Shift 切换中英
 - 中文标点，引号自动配对
 - 不开 AI 预测选词就不联网；日志不记输入内容

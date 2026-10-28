@@ -1,9 +1,10 @@
-//! `cargo xtask ai-eval [服务商]`：拿 eval/context.tsv 的用例实测 AI 预测选词。
+//! `cargo xtask ai-eval [服务商] [--no-context]`：拿 eval/context.tsv 的用例实测 AI 预测选词。
 //!
 //! 每条用例是光标前的文字、接着打的拼音和想要的那句。用真的输入会话打一遍拼音，拿输入法会发给模型的那几句让它挑，
 //! 发出去的和打字时一模一样。报告引擎首选和模型
 //! 各对了多少、按把握度决定换不换首选时对了多少，还有延迟和 token。用的是输入法那份 AI 设置：设置文件里选的
 //! 服务商（命令后面写服务商可以换一家，写法同设置文件的 provider），ai.toml 里这一家的 Key 和模型。
+//! `--no-context` 不给前文，像在空的输入框里打字：主要看「首选就对」的会不会被改错。
 //! 要联网、要 Key，所以不放进 qa。
 
 use std::path::{Path, PathBuf};
@@ -35,14 +36,16 @@ struct Result {
     engine_right: bool,
     /// 想要的那句在给模型挑的整句里。
     covered: bool,
-    /// 模型挑的对不对，和它的把握度。
+    /// 模型挑的对不对，和它的把握度（聊天模型不给）。
     picked_right: bool,
-    confidence: f64,
+    confidence: Option<f64>,
+    /// 输入法会不会拿它挑的换首选（`Pick::trusted`）。
+    trusted: bool,
     elapsed: Duration,
     tokens: u64,
 }
 
-pub fn run(root: &Path, engine: &Arc<Engine>, provider: Option<&str>) -> ExitCode {
+pub fn run(root: &Path, engine: &Arc<Engine>, provider: Option<&str>, no_context: bool) -> ExitCode {
     let client = match client(provider) {
         Ok(client) => client,
         Err(err) => {
@@ -57,17 +60,22 @@ pub fn run(root: &Path, engine: &Arc<Engine>, provider: Option<&str>) -> ExitCod
             return ExitCode::from(2);
         }
     };
-    println!("{} 条用例，{} 的 {}\n", cases.len(), client.provider().name(), client.model());
+    let how = if no_context { "，不给前文" } else { "" };
+    println!("{} 条用例，{} 的 {}{how}\n", cases.len(), client.provider().name(), client.model());
     let mut results = Vec::new();
     let mut failed = 0;
     for case in &cases {
-        let Some(query) = query(engine, &case.pinyin) else {
-            println!("  ! {}「{}」输入法不会拿去问 AI，跳过", case.pinyin, case.context);
-            failed += 1;
-            continue;
+        let query = match query(engine, &case.pinyin) {
+            Ok(query) => query,
+            Err(reason) => {
+                println!("  ! {}「{}」输入法不会拿去问 AI（{reason}），跳过", case.pinyin, case.context);
+                failed += 1;
+                continue;
+            }
         };
         let texts: Vec<&str> = query.sentences.iter().map(|sentence| sentence.text.as_str()).collect();
-        let attempt = || client.pick(&case.context, &case.pinyin, &texts);
+        let context = if no_context { "" } else { case.context.as_str() };
+        let attempt = || client.pick(context, &case.pinyin, &texts);
         let mut outcome = attempt();
         for retry in 1..=RETRIES {
             if outcome.is_ok() {
@@ -90,18 +98,19 @@ pub fn run(root: &Path, engine: &Arc<Engine>, provider: Option<&str>) -> ExitCod
             covered: texts.contains(&case.expected.as_str()),
             picked_right: chosen == case.expected,
             confidence: pick.confidence,
+            trusted: pick.trusted(),
             elapsed,
             tokens: pick.input_tokens,
         };
         if !result.picked_right {
             let first = texts.first().copied().unwrap_or("（没有整句）");
             println!(
-                "  ✗ {}「{}」{}：要「{}」，模型挑了「{chosen}」（把握 {:.2}），引擎首选「{first}」{}",
+                "  ✗ {}「{}」{}：要「{}」，模型挑了「{chosen}」（把握 {}），引擎首选「{first}」{}",
                 case.category,
                 case.context,
                 case.pinyin,
                 case.expected,
-                pick.confidence,
+                pick.confidence.map_or("没给".into(), |confidence| format!("{confidence:.2}")),
                 if result.covered { "" } else { "，想要的不在候选里" }
             );
         }
@@ -116,8 +125,8 @@ pub fn run(root: &Path, engine: &Arc<Engine>, provider: Option<&str>) -> ExitCod
     ExitCode::SUCCESS
 }
 
-/// 输入法打这串拼音时会拿去问 AI 的那几句，第一句是首选。不会问的（比如首选用了纠错）是 None。
-fn query(engine: &Arc<Engine>, pinyin: &str) -> Option<AiQuery> {
+/// 输入法打这串拼音时会拿去问 AI 的那几句，第一句是首选。不会问的（比如首选用了纠错）返回原因。
+fn query(engine: &Arc<Engine>, pinyin: &str) -> std::result::Result<AiQuery, &'static str> {
     let mut session = Session::new(engine.clone());
     for c in pinyin.chars() {
         session.handle_key(Key::Char(c), Modifiers::default());
@@ -160,18 +169,24 @@ fn report(results: &[(&Case, Result)]) {
         count(&|case, result| case.category == ALREADY_RIGHT && result.engine_right),
         count(&|_, result| result.covered),
     );
-    for threshold in THRESHOLDS {
-        // 把握度到门槛才用模型挑的，否则留着引擎首选
-        let used = |result: &Result| result.confidence >= threshold;
+    // `used` 的那些用模型挑的，其余留着引擎首选
+    let row = |how: &str, used: &dyn Fn(&Result) -> bool| {
         let final_right = |result: &Result| if used(result) { result.picked_right } else { result.engine_right };
         println!(
-            "  把握度 ≥ {threshold:.1} 才换：对了 {}/{total}，修好 {}，改错 {}（用了模型 {} 次）",
+            "  {how}：对了 {}/{total}，修好 {}，改错 {}（用了模型 {} 次）",
             count(&|_, result| final_right(result)),
             count(&|_, result| !result.engine_right && final_right(result)),
             count(&|_, result| result.engine_right && !final_right(result)),
             count(&|_, result| used(result)),
         );
+    };
+    // 聊天模型不给把握度，各个门槛都当它有把握
+    for threshold in THRESHOLDS {
+        row(&format!("把握度 ≥ {threshold:.1} 才换"), &|result| {
+            result.confidence.is_none_or(|c| c >= threshold)
+        });
     }
+    row("照输入法的规则换", &|result| result.trusted);
     let mut elapsed: Vec<Duration> = results.iter().map(|(_, result)| result.elapsed).collect();
     elapsed.sort();
     let at = |q: f64| util::percentile(&elapsed, q).unwrap_or_default();

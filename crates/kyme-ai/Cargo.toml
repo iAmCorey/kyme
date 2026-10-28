@@ -8,6 +8,6 @@ license.workspace = true
 
 [dependencies]
 kyme-core = { path = "../kyme-core" }
-# 跟着系统代理走（各家的接口多在国外），证书用系统的
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots", "macos-system-configuration"] }
+# 跟着系统代理走（各家的接口多在国外），证书用系统的。开 http2：上一次还没回又问了，也共用一条连接，不用再握手
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "http2", "json", "rustls-tls-native-roots", "macos-system-configuration"] }
 serde_json = "1.0.154"

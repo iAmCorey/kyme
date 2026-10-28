@@ -11,7 +11,7 @@ cargo xtask qa                          # 按改动挑检查：只跑和还没�
 cargo xtask qa --all                    # 全部自动检查：格式、clippy、单元测试、评测、按键场景、安装包、macOS 接入层，约 1 分钟
 cargo xtask qa --only eval,scenarios    # 只跑列出的检查
 cargo xtask qa --release                # 发版才跑：全部检查，再加发版要求（已提交、LICENSE）和人工检查清单
-cargo xtask ai-eval [服务商]            # 实测 AI 预测选词（eval/context.tsv），用输入法的 AI 设置，联网、要 Key，不在 qa 里
+cargo xtask ai-eval [服务商]            # 实测 AI 预测选词（eval/context.tsv），用输入法的 AI 设置，联网、要 Key，不在 qa 里；--no-context 不给前文
 cargo test -p kyme-core zero_selects    # 跑单个测试，按名字过滤
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all                         # rustfmt.toml：max_width 120
@@ -40,8 +40,8 @@ cargo run --release -p kyme-pinyin --example repl -- data/rime-ice/8105.dict.yam
   - `SELECT_KEYS` 是选字键、候选窗序号和每页上限的唯一来源。
 - **`kyme-ui`**：GPUI 候选窗和设置窗口。尺寸都在 `Metrics` 里按字号等比缩放；平台层先 `measure()`，再摆放窗口。输入框 `input.rs` 照 GPUI 自带的示例改，支持输入法组字，填 Key 时只显示圆点。
 - **`kyme-macos`**：同一个可执行文件兼任输入法进程、安装工具（`--install`）、自测模式（`--qa`）和设置窗口（`--settings`）。IMK 回调和 GPUI 都跑在主线程，全局状态放在 thread_local 里。IMK 回调以外（计时器、AI 的回答、鼠标）别占着全局状态向 App 跨进程要东西：等回话时 IMK 会把接着按的键送进来，状态被占着的话这个键只能原样交给 App。
-- **AI 组句的路径**：输入法里每次组字后 `state::schedule_ai` 等 200ms，输入没变就用 `Session::ai_query` 拿前几名整句、`client::text_before_cursor` 读光标前的文字，在后台问设置里选的那家；回来时把握度够、输入还没变，`Session::offer_ai` 把它挑的那句放到第一个（✨），原首选排第二。✨ 出现后 0.3 秒内的按键先撤掉 ✨ 再处理。会话本身不联网。
-- **`kyme-ai`**：AI 组句，只有它联网。把光标前的文字和引擎的前几名整句（`Engine::sentences`）交给设置里选的服务商（TypeSafe 的 Jev、Anthropic，和 OpenAI 兼容的几家，预设的地址和模型在 `kyme_ai::preset`；也可以自定义接口），让它挑接得最顺的一句；模型只能从候选里挑，读音不会错。各家的 Key 和模型（自定义的还有地址）存在设置文件旁边的 ai.toml，只有自己能读写，不用钥匙串。
+- **AI 预测选词的路径**：输入法里每次组字后 `state::schedule_ai` 等 100ms，输入没变就用 `Session::ai_query` 拿前几名整句（不问时它返回原因，记进日志），在后台问设置里选的那家。光标前的文字用 `client::text_before_cursor` 读，一段输入只读一次；读不到、没有字也问。回来时信得过（`kyme_ai::Pick::trusted`：把握度够，没有前文时要更有把握）、输入还没变，`Session::offer_ai` 把它挑的那句放到第一个（✨），原首选排第二；挑的就是首选也标 ✨。✨ 出现后 0.3 秒内的按键先撤掉 ✨ 再处理。切到输入框、开始打字时，好一阵没连过（`Client::cold`）就由 `warm_ai` 先在后台连上服务商，问的时候不用再握手。会话本身不联网。
+- **`kyme-ai`**：AI 预测选词，只有它联网。把光标前的文字和引擎的前几名整句（`Engine::sentences`）交给设置里选的服务商（TypeSafe 的 Jev、Anthropic，和 OpenAI 兼容的几家，预设的地址和模型在 `kyme_ai::preset`；也可以自定义接口），让它挑接得最顺的一句；模型只能从候选里挑，读音不会错。各家的 Key 和模型（自定义的还有地址）存在设置文件旁边的 ai.toml，只有自己能读写，不用钥匙串。
 - **`xtask`**：QA。`Kyme --qa` 用一个假的 IMK 输入框，跑真正的会话、接入层和候选窗，每个键都和本地的参照 `Session` 对照。
 
 ## 纠错的硬规则

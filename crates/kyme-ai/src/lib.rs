@@ -4,9 +4,11 @@
 //! 服务商在设置里选（[`AiProvider`]），按接口分三种：
 //! - TypeSafe 的 Jev（文档在 https://docs.typesafe.ai）：不生成文字，只在给定的选项里挑一个，并给出把握有多大。
 //! - Anthropic 的 Claude，和 OpenAI 兼容的接口（OpenAI、DeepSeek、通义千问、Kimi、智谱、OpenRouter，还有自定义的）：
-//!   聊天模型。把整句编上号，让它只回编号，拿不准时回 1，也就是引擎的首选。它们不给把握度，一律当作有把握。
+//!   聊天模型。把整句编上号，让它只回编号，拿不准时回 1，也就是引擎的首选。它们不给把握度：有前文时照用它挑的，
+//!   没有前文时不拿它换首选（见 [`Pick::trusted`]）。
 
 use std::fmt;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use kyme_core::{AiProvider, AiService};
@@ -15,6 +17,14 @@ use serde_json::{Map, Value, json};
 
 /// 等这么久还没回就算了：AI 只是锦上添花，打字不等它。
 const TIMEOUT: Duration = Duration::from_secs(3);
+/// 这么久没和服务商连过，连接多半已经断了（实测 30–60 秒不用就断），再问时要重新握手（见 `Client::cold`）。
+const IDLE: Duration = Duration::from_secs(20);
+/// 有前文时，把握度到这个数才拿 AI 挑的换首选。评测里这个门槛下没有把对的改错过（cargo xtask ai-eval）；
+/// 实际打字时不少回答在 0.3–0.5 之间，门槛定在 0.5 会白白丢掉。
+const CONFIDENCE: f64 = 0.3;
+/// 光标前没有字时 AI 只能凭字面猜，要这么有把握才换。不给前文的评测（ai-eval --no-context）里，
+/// 0.3 会把 17 个对的首选改错 7 个，0.7 一个也没改错。
+const CONFIDENCE_ALONE: f64 = 0.7;
 /// TypeSafe 的问题名，回复里按它找答案。
 const QUESTION: &str = "next";
 /// Anthropic 的 API 版本。
@@ -27,7 +37,7 @@ const ANTHROPIC_MAX_TOKENS: u32 = 1024;
 const CLAUDE: &str = "claude-opus-5-5";
 const ANTHROPIC_FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 /// 聊天模型的系统提示。
-const SYSTEM: &str = "你是中文拼音输入法的选词助手。用户在光标前已经写了一些字，接着用拼音输入法打了一串拼音，\
+const SYSTEM: &str = "你是中文拼音输入法的选词助手。用户接着光标前的文字（前文，可能没有）用拼音输入法打了一串拼音，\
                       下面列出这串拼音能打出的几句。挑出接在前文后面最通顺、最可能是用户想打的那一句，\
                       只回答它的编号，不要别的字。拿不准就回答 1。";
 
@@ -145,10 +155,23 @@ pub struct Pick {
     /// 挑中的是第几个候选。
     pub index: usize,
     /// 把握度，0 到 1：最大的那个概率比平均分出来的高多少，选项越多同样的概率把握度越高。
-    /// 只有 TypeSafe 给，聊天模型一律是 1。
-    pub confidence: f64,
+    /// 只有 TypeSafe 给，聊天模型不给。
+    pub confidence: Option<f64>,
+    /// 问的时候光标前没有字。
+    pub alone: bool,
     /// 这次用了多少输入 token。
     pub input_tokens: u64,
+}
+
+impl Pick {
+    /// 信不信得过它挑的，拿来换掉首选：把握度要够，没有前文时要更有把握。聊天模型不给把握度，有前文时照用，
+    /// 没有前文时不换。
+    pub fn trusted(&self) -> bool {
+        match self.confidence {
+            Some(confidence) => confidence >= if self.alone { CONFIDENCE_ALONE } else { CONFIDENCE },
+            None => !self.alone,
+        }
+    }
 }
 
 pub struct Client {
@@ -159,6 +182,8 @@ pub struct Client {
     model: String,
     /// 自定义的接口可以不要 Key（本机跑的 Ollama 之类），这时是空的，请求里不带。
     key: String,
+    /// 上次和服务商连接的时间：问它，或者预先连上。
+    contacted: Mutex<Option<Instant>>,
 }
 
 impl Client {
@@ -182,7 +207,15 @@ impl Client {
             .build()
             .map_err(|err| format!("无法创建 HTTP 客户端：{err}"))?;
         let url = url(preset.api, endpoint);
-        Ok(Client { http, provider, api: preset.api, url, model: model.into(), key: key.into() })
+        Ok(Client {
+            http,
+            provider,
+            api: preset.api,
+            url,
+            model: model.into(),
+            key: key.into(),
+            contacted: Mutex::new(None),
+        })
     }
 
     pub fn provider(&self) -> AiProvider {
@@ -194,10 +227,32 @@ impl Client {
         &self.model
     }
 
-    /// 光标前是 `context`，接着打了拼音 `pinyin`，在 `candidates` 里挑接得最顺的一个。
+    /// 好一阵没和服务商连过、连接多半已经断了的话返回 true，并记下这就去连：接着在后台调 `warm`，
+    /// 后面几个键就不会再去连。
+    pub fn cold(&self) -> bool {
+        let Ok(mut contacted) = self.contacted.lock() else { return false };
+        let cold = contacted.is_none_or(|at| at.elapsed() >= IDLE);
+        if cold {
+            *contacted = Some(Instant::now());
+        }
+        cold
+    }
+
+    /// 先连上服务商：握手（走代理时要大半秒）趁打字的时候做，停下来问的时候连接已经好了。
+    /// 只发一个不带 Key、不带内容的 HEAD，回什么都不管。要等网络，在后台调。
+    pub fn warm(&self) {
+        let _ = self.http.head(&self.url).send();
+    }
+
+    /// 光标前是 `context`（可能没有），接着打了拼音 `pinyin`，在 `candidates` 里挑接得最顺的一个。
     /// 还返回从发出请求到收到回复用了多久。
     pub fn pick(&self, context: &str, pinyin: &str, candidates: &[&str]) -> Result<(Pick, Duration), Error> {
+        // 只有空白也算没有前文
+        let context = if context.trim().is_empty() { "" } else { context };
         let started = Instant::now();
+        if let Ok(mut contacted) = self.contacted.lock() {
+            *contacted = Some(started);
+        }
         let response =
             self.request(context, pinyin, candidates).send().map_err(|err| Error::Other(unreachable(&err)))?;
         let status = response.status().as_u16();
@@ -216,7 +271,7 @@ impl Client {
             Api::OpenAi => parse_openai(&reply, candidates.len()),
             Api::Anthropic => parse_anthropic(&reply, candidates.len()),
         };
-        pick.map(|pick| (pick, elapsed)).map_err(Error::Other)
+        pick.map(|pick| (Pick { alone: context.is_empty(), ..pick }, elapsed)).map_err(Error::Other)
     }
 
     fn request(&self, context: &str, pinyin: &str, candidates: &[&str]) -> RequestBuilder {
@@ -238,8 +293,12 @@ impl Client {
 /// TypeSafe：光标前的文字是 state，候选是一道选择题的选项。选项的名字就是候选的文字，模型直接看得到。
 fn typesafe_request(model: &str, context: &str, pinyin: &str, candidates: &[&str]) -> Value {
     let criteria: Map<String, Value> = candidates.iter().map(|text| (text.to_string(), Value::Null)).collect();
-    let instructions =
-        format!("这是用户光标前已经写好的文字。用户接着用拼音输入法打了「{pinyin}」，下面哪一个最可能是用户想打的？");
+    let opening = if context.is_empty() {
+        "用户在光标前没有文字的地方，"
+    } else {
+        "这是用户光标前已经写好的文字。用户接着"
+    };
+    let instructions = format!("{opening}用拼音输入法打了「{pinyin}」，下面哪一个最可能是用户想打的？");
     json!({
         "model": model,
         "state": context,
@@ -251,6 +310,7 @@ fn typesafe_request(model: &str, context: &str, pinyin: &str, candidates: &[&str
 
 /// 聊天模型看到的那段话：前文、拼音，和编了号的整句。
 fn chat_prompt(context: &str, pinyin: &str, candidates: &[&str]) -> String {
+    let context = if context.is_empty() { "（无）" } else { context };
     let mut prompt = format!("前文：{context}\n拼音：{pinyin}\n");
     for (i, candidate) in candidates.iter().enumerate() {
         prompt.push_str(&format!("{}. {candidate}\n", i + 1));
@@ -292,7 +352,8 @@ fn parse_typesafe(reply: &Value, candidates: &[&str]) -> Result<Pick, String> {
     let index = candidates.iter().position(|text| *text == chosen).ok_or("返回的选项不在候选中")?;
     Ok(Pick {
         index,
-        confidence: answer["confidence"].as_f64().unwrap_or(0.0),
+        confidence: Some(answer["confidence"].as_f64().unwrap_or(0.0)),
+        alone: false,
         input_tokens: reply["usage"]["input_tokens"].as_u64().unwrap_or(0),
     })
 }
@@ -300,7 +361,12 @@ fn parse_typesafe(reply: &Value, candidates: &[&str]) -> Result<Pick, String> {
 fn parse_openai(reply: &Value, count: usize) -> Result<Pick, String> {
     let text = reply["choices"][0]["message"]["content"].as_str().ok_or("返回结果为空")?;
     let index = chosen_number(text, count)?;
-    Ok(Pick { index, confidence: 1.0, input_tokens: reply["usage"]["prompt_tokens"].as_u64().unwrap_or(0) })
+    Ok(Pick {
+        index,
+        confidence: None,
+        alone: false,
+        input_tokens: reply["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+    })
 }
 
 /// Anthropic 的回复：前面可能有思考块，取文字块；被拒绝了就没有答案。
@@ -314,7 +380,12 @@ fn parse_anthropic(reply: &Value, count: usize) -> Result<Pick, String> {
         .and_then(|block| block["text"].as_str())
         .ok_or("返回结果为空")?;
     let index = chosen_number(text, count)?;
-    Ok(Pick { index, confidence: 1.0, input_tokens: reply["usage"]["input_tokens"].as_u64().unwrap_or(0) })
+    Ok(Pick {
+        index,
+        confidence: None,
+        alone: false,
+        input_tokens: reply["usage"]["input_tokens"].as_u64().unwrap_or(0),
+    })
 }
 
 /// 聊天模型回的编号（从 1 起），换成下标。取回复里的第一个数。
@@ -370,6 +441,24 @@ mod tests {
     }
 
     #[test]
+    fn warms_up_once_until_idle_again() {
+        let client = Client::new(AiProvider::TypeSafe, &service("ts-key", "", "")).unwrap();
+        assert!(client.cold(), "还没连过");
+        assert!(!client.cold(), "刚去连了，接着的键不再去连");
+    }
+
+    #[test]
+    fn trusts_a_pick_only_when_sure_enough() {
+        let pick = |confidence, alone| Pick { index: 1, confidence, alone, input_tokens: 0 };
+        assert!(pick(Some(0.4), false).trusted());
+        assert!(!pick(Some(0.2), false).trusted());
+        assert!(!pick(Some(0.4), true).trusted(), "没有前文要更有把握");
+        assert!(pick(Some(0.8), true).trusted());
+        assert!(pick(None, false).trusted(), "聊天模型有前文时照用");
+        assert!(!pick(None, true).trusted(), "聊天模型没有前文时不换");
+    }
+
+    #[test]
     fn every_provider_has_somewhere_to_send() {
         for provider in AiProvider::ALL {
             let preset = preset(provider);
@@ -387,12 +476,15 @@ mod tests {
         assert_eq!(question["type"], "choice");
         assert!(question["instructions"].as_str().unwrap().contains("haonanhe"));
         assert_eq!(question["criteria"], json!({ "好难和": null, "好难喝": null }));
+        let body = typesafe_request("jev-1.14.0", "", "haonanhe", &CANDIDATES);
+        assert!(body["questions"][QUESTION]["instructions"].as_str().unwrap().contains("没有文字"), "光标前没有字");
     }
 
     #[test]
     fn asks_chat_models_for_a_number() {
         let prompt = chat_prompt("真是", "haonanhe", &CANDIDATES);
         assert_eq!(prompt, "前文：真是\n拼音：haonanhe\n1. 好难和\n2. 好难喝\n");
+        assert!(chat_prompt("", "haonanhe", &CANDIDATES).starts_with("前文：（无）\n"), "光标前没有字");
         let body = openai_request("deepseek-chat", "真是", "haonanhe", &CANDIDATES);
         assert_eq!(body["messages"][0]["content"], SYSTEM);
         assert_eq!(body["messages"][1]["content"], prompt);
@@ -410,18 +502,21 @@ mod tests {
             "answers": { QUESTION: { "type": "choice", "choice": "好难喝", "confidence": 0.8 } },
             "usage": { "input_tokens": 120, "output_tokens": 12 },
         });
-        assert_eq!(parse_typesafe(&reply, &CANDIDATES), Ok(Pick { index: 1, confidence: 0.8, input_tokens: 120 }));
+        assert_eq!(
+            parse_typesafe(&reply, &CANDIDATES),
+            Ok(Pick { index: 1, confidence: Some(0.8), alone: false, input_tokens: 120 })
+        );
         assert!(parse_typesafe(&reply, &["好难和"]).is_err(), "挑了候选以外的");
 
         let reply = json!({ "choices": [{ "message": { "content": "2" } }], "usage": { "prompt_tokens": 90 } });
-        assert_eq!(parse_openai(&reply, 2), Ok(Pick { index: 1, confidence: 1.0, input_tokens: 90 }));
+        assert_eq!(parse_openai(&reply, 2), Ok(Pick { index: 1, confidence: None, alone: false, input_tokens: 90 }));
 
         let reply = json!({
             "stop_reason": "end_turn",
             "content": [{ "type": "thinking", "thinking": "" }, { "type": "text", "text": "第 2 句" }],
             "usage": { "input_tokens": 80 },
         });
-        assert_eq!(parse_anthropic(&reply, 2), Ok(Pick { index: 1, confidence: 1.0, input_tokens: 80 }));
+        assert_eq!(parse_anthropic(&reply, 2), Ok(Pick { index: 1, confidence: None, alone: false, input_tokens: 80 }));
         assert!(parse_anthropic(&json!({ "stop_reason": "refusal", "content": [] }), 2).is_err());
     }
 

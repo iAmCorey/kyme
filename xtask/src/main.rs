@@ -30,7 +30,9 @@ use crate::report::{Outcome, Report, Status};
 
 const USAGE: &str = "\
 用法：cargo xtask qa [--all] [--manual] [--release] [--only 检查,...]
-      cargo xtask ai-eval [服务商]   实测 AI 预测选词：联网，用输入法的 AI 设置；后面写服务商（比如 deepseek）可以换一家
+      cargo xtask ai-eval [服务商] [--no-context]
+                 实测 AI 预测选词：联网，用输入法的 AI 设置；写服务商（比如 deepseek）可以换一家，
+                 --no-context 不给前文，看光标前没有字时会不会把对的改错
 
   不带参数   按改动挑检查：只跑和还没推送的改动有关的那几项
   --all      全部自动检查：格式、clippy、单元测试、评测、按键场景、安装包、macOS 接入层。不动输入法设置，也不占屏幕
@@ -44,16 +46,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("qa") => qa(&args[1..]),
-        Some("ai-eval") => {
-            let root = repo_root();
-            match load_engine(&root) {
-                Ok(loaded) => ai_eval::run(&root, &loaded.engine, args.get(1).map(String::as_str)),
-                Err(err) => {
-                    eprintln!("{err}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
+        Some("ai-eval") => ai_eval(&args[1..]),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
@@ -199,6 +192,30 @@ fn load_engine(root: &Path) -> Result<Loaded, String> {
     let load_time = started.elapsed();
     let entries = engine.dictionary().len();
     Ok(Loaded { engine: Arc::new(engine), entries, load_time })
+}
+
+/// `cargo xtask ai-eval [服务商] [--no-context]`。
+fn ai_eval(args: &[String]) -> ExitCode {
+    let mut provider = None;
+    let mut no_context = false;
+    for arg in args {
+        match arg.as_str() {
+            "--no-context" => no_context = true,
+            id if !id.starts_with('-') && provider.is_none() => provider = Some(id),
+            other => {
+                eprintln!("不认识的参数 {other}\n\n{USAGE}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let root = repo_root();
+    match load_engine(&root) {
+        Ok(loaded) => ai_eval::run(&root, &loaded.engine, provider, no_context),
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn qa(args: &[String]) -> ExitCode {

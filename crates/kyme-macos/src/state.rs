@@ -27,11 +27,8 @@ const HINT_DURATION: Duration = Duration::from_millis(1500);
 const SLOW_KEY: Duration = Duration::from_millis(100);
 /// 学到新词后停这么久再存盘，打字时不反复写文件。
 const SAVE_DELAY: Duration = Duration::from_secs(10);
-/// 打字停下来这么久才问 AI：一直在打的时候不问，免得白发请求。
-const AI_PAUSE: Duration = Duration::from_millis(200);
-/// AI 的把握度到这个数才换首选。评测里这个门槛下没有把对的改错过（cargo xtask ai-eval）；
-/// 实际打字时不少回答在 0.3–0.5 之间，门槛定在 0.5 会白白丢掉。
-const AI_CONFIDENCE: f64 = 0.3;
+/// 打字停下来这么久才问 AI：一直在打的时候不问，免得白发请求。问出去以后又打了字，回来的答案就扔掉。
+const AI_PAUSE: Duration = Duration::from_millis(100);
 /// 光标前最多读这么多字当前文。
 const CONTEXT_CHARS: usize = 64;
 /// 小键盘上的回车，core-graphics 没有这个常量。
@@ -66,7 +63,7 @@ pub struct AppState {
     caret: NSRect,
     /// 每次显示中英提示加一，过期的隐藏任务据此作废。
     hint_generation: u64,
-    /// AI 组句：设置里开着、ai.toml 里这一家的 Key 填好了才有。
+    /// AI 预测选词：设置里开着、ai.toml 里这一家的 Key 填好了才有。
     ai: Option<Arc<kyme_ai::Client>>,
     /// ai.toml：各家服务商的 Key、模型和接口地址。
     ai_file: AiFile,
@@ -78,6 +75,8 @@ pub struct AppState {
     ai_timer: Option<Task<()>>,
     /// 已经问过 AI 的那一次输入，同一次不重复问。
     ai_asked: u64,
+    /// 这一段输入里读到的光标前的文字，读不到是空的。组字时它不会变，只读一次；输入结束就作废。
+    ai_before: Option<String>,
     timings: Timings,
 }
 
@@ -114,6 +113,10 @@ pub fn activate() {
         state.reload_user_words();
         state.reload_local_dicts();
         state.load_ai();
+        // 切到输入框，又是中文状态，多半是要打字了
+        if state.session.mode() == Mode::Chinese {
+            state.warm_ai();
+        }
     });
 }
 
@@ -130,6 +133,7 @@ pub fn finish_composition(client: &AnyObject) {
         }
         state.marked.clear();
         state.client = None;
+        state.ai_before = None;
         state.panel.hide();
         state.save_user_words();
     });
@@ -171,6 +175,7 @@ impl AppState {
             ai_for: None,
             ai_timer: None,
             ai_asked: 0,
+            ai_before: None,
             timings: Timings::default(),
         };
         state.reload_settings();
@@ -258,7 +263,7 @@ impl AppState {
             }
         };
         log::info!(
-            "设置已载入：每页 {} 个候选，字号 {}，内嵌拼音{}，AI 组句{}",
+            "设置已载入：每页 {} 个候选，字号 {}，内嵌拼音{}，AI 预测选词{}",
             settings.input.page_size,
             settings.appearance.font_size,
             if settings.input.inline_pinyin { "开" } else { "关" },
@@ -267,7 +272,7 @@ impl AppState {
         self.session.set_settings(settings);
     }
 
-    /// AI 组句开着的话，照设置和 ai.toml 在后台建好；选的那一家的设置改过（设置窗口里刚填了 Key）就重建。
+    /// AI 预测选词开着的话，照设置和 ai.toml 在后台建好；选的那一家的设置改过（设置窗口里刚填了 Key）就重建。
     fn load_ai(&mut self) {
         match self.ai_file.reload() {
             Some(Ok(services)) => self.ai_services = services,
@@ -292,10 +297,10 @@ impl AppState {
             }
             match built {
                 Ok(client) => {
-                    log::info!("AI 组句准备好了：{}，{}", client.provider().name(), client.model());
+                    log::info!("AI 预测选词准备好了：{}，{}", client.provider().name(), client.model());
                     state.ai = Some(Arc::new(client));
                 }
-                Err(err) => log::info!("AI 组句开着，但{err}"),
+                Err(err) => log::info!("AI 预测选词开着，但{err}"),
             }
         });
     }
@@ -305,6 +310,7 @@ impl AppState {
         if self.ai.is_none() {
             return;
         }
+        self.warm_ai();
         let generation = self.session.generation();
         let pause = self.app.background_executor().timer(AI_PAUSE);
         self.ai_timer = Some(self.app.foreground_executor().spawn(async move {
@@ -312,33 +318,53 @@ impl AppState {
             let Some((ai, client)) = with_state(None, |state| state.ai_request(generation)) else { return };
             // 读光标前的文字是一次跨进程的同步调用，等 App 回话时 IMK 会把接着按的键送进来。
             // 这时不能占着全局状态：占着的话那个键进不了输入法，只能原样交给 App（打 lingwai 上屏一个 l）
-            let before = client::text_before_cursor(&client, CONTEXT_CHARS);
+            let before = client.map(|client| client::text_before_cursor(&client, CONTEXT_CHARS).unwrap_or_default());
             with_state((), |state| state.ask_ai(ai, generation, before));
         }));
     }
 
-    /// 停顿到了、输入还是那一次的话，取出问 AI 要用的 AI 和输入框，记下这一次问过了。
-    fn ai_request(&mut self, generation: u64) -> Option<(Arc<kyme_ai::Client>, Retained<AnyObject>)> {
+    /// 好一阵没和 AI 服务商连过的话，在后台先连上。重新握手要大半秒（走代理更久），等停下来要问时再连就晚了。
+    fn warm_ai(&self) {
+        if let Some(ai) = self.ai.as_ref().filter(|ai| ai.cold()) {
+            let ai = ai.clone();
+            self.app.background_executor().spawn(async move { ai.warm() }).detach();
+        }
+    }
+
+    /// 停顿到了、输入还是那一次的话，取出问 AI 要用的 AI，和要去读光标前文字的输入框（这一段输入里读过了就不用），
+    /// 记下这一次问过了。
+    fn ai_request(&mut self, generation: u64) -> Option<(Arc<kyme_ai::Client>, Option<Retained<AnyObject>>)> {
         if self.session.generation() != generation || self.ai_asked == generation {
             return None;
         }
-        let request = (self.ai.clone()?, self.client.clone()?);
+        let client = match self.ai_before {
+            Some(_) => None,
+            None => Some(self.client.clone()?),
+        };
+        let ai = self.ai.clone()?;
         self.ai_asked = generation;
-        Some(request)
+        Some((ai, client))
     }
 
-    /// 读到了光标前的文字 `before`：输入还是那一次的话，在后台问 AI。
+    /// 输入还是那一次的话，在后台问 AI。`before` 是刚读到的光标前的文字，没去读是 None。
     fn ask_ai(&mut self, ai: Arc<kyme_ai::Client>, generation: u64, before: Option<String>) {
         // 读的时候又打了字，这一次就不问了
         if self.session.generation() != generation {
             return;
         }
-        let Some(query) = self.session.ai_query() else { return };
-        // 前文是光标前的文字，加上这一段里已经选定的字。没有前文，AI 也挑不出比引擎更好的
-        let context = before.unwrap_or_default() + &query.selected;
-        if context.trim().is_empty() {
-            return;
+        if before.is_some() {
+            self.ai_before = before;
         }
+        let query = match self.session.ai_query() {
+            Ok(query) => query,
+            Err(reason) => {
+                log::info!("AI 预测选词：没问，{reason}");
+                return;
+            }
+        };
+        // 前文是光标前的文字，加上这一段里已经选定的字。没有前文（空的输入框，或者 App 不给读）也问，
+        // 挑的就是首选时标上 ✨，看得出 AI 看过了；只是要更有把握才换（见 `kyme_ai::Pick::trusted`）
+        let context = self.ai_before.clone().unwrap_or_default() + &query.selected;
         let asking = self.app.background_executor().spawn(async move {
             let sentences: Vec<&str> = query.sentences.iter().map(|sentence| sentence.text.as_str()).collect();
             let answer = ai.pick(&context, &query.pinyin, &sentences);
@@ -347,7 +373,8 @@ impl AppState {
         self.when(asking, |state, (query, answer, ai)| state.take_ai_answer(&query, answer, &ai));
     }
 
-    /// `asked` 回答了：把握度够、输入还没变，就把它挑的那句放到第一个、重画候选窗。日志只记耗时和结果，不记内容。
+    /// `asked` 回答了：信得过、输入还没变，就把它挑的那句放到第一个、重画候选窗；挑的就是首选，也标上 ✨。
+    /// 日志只记耗时和结果，不记内容。
     fn take_ai_answer(
         &mut self,
         query: &AiQuery,
@@ -356,26 +383,30 @@ impl AppState {
     ) {
         match answer {
             Ok((pick, elapsed)) => {
-                let outcome = if pick.index == 0 {
-                    "和首选一样"
-                } else if pick.confidence < AI_CONFIDENCE {
+                let agreed = pick.index == 0;
+                let outcome = if !agreed && !pick.trusted() {
                     "把握不够，没换"
                 } else if self.session.offer_ai(query, pick.index, Instant::now()) {
                     self.redraw();
-                    "换了首选"
+                    if agreed { "和首选一样，标上 ✨" } else { "换了首选" }
                 } else {
-                    "输入已经变了，没换"
+                    "输入已经变了，没用上"
                 };
-                log::info!("AI 组句 {elapsed:?}，挑了第 {} 句，把握 {:.2}，{outcome}", pick.index + 1, pick.confidence);
+                log::info!(
+                    "AI 预测选词 {elapsed:?}{}，挑了第 {} 句，把握 {}，{outcome}",
+                    if pick.alone { "（没有前文）" } else { "" },
+                    pick.index + 1,
+                    pick.confidence.map_or("没给".into(), |confidence| format!("{confidence:.2}"))
+                );
             }
             // Key 不对：停掉问的那个，等设置窗口里换了 Key 再重建。这期间已经换上新的了就不动新的
             Err(kyme_ai::Error::Key) => {
-                log::warn!("AI 组句：API Key 不对");
+                log::warn!("AI 预测选词：API Key 不对");
                 if self.ai.as_ref().is_some_and(|ai| Arc::ptr_eq(ai, asked)) {
                     self.ai = None;
                 }
             }
-            Err(err) => log::warn!("AI 组句没成：{}", err.log_line()),
+            Err(err) => log::warn!("AI 预测选词没成：{}", err.log_line()),
         }
     }
 
@@ -426,6 +457,7 @@ impl AppState {
         }
         match response.view {
             View::Idle => {
+                self.ai_before = None;
                 if !self.marked.is_empty() {
                     client::set_marked_text(client, "");
                     self.marked.clear();
