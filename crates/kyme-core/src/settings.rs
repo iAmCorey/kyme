@@ -19,6 +19,7 @@ use crate::session::SELECT_KEYS;
 pub struct Settings {
     pub input: InputSettings,
     pub appearance: AppearanceSettings,
+    pub ai: AiSettings,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -55,6 +56,80 @@ pub struct AppearanceSettings {
 impl Default for AppearanceSettings {
     fn default() -> Self {
         AppearanceSettings { font_size: 15.0, font_family: String::new(), highlight_color: Rgb(0x5e5ce6) }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct AiSettings {
+    /// AI 预测选词：打字停下来时，把光标前的文字和几个候选整句发给 `provider` 这家的模型，让它挑接得最顺的一句，
+    /// 放在第一个、标 ✨。默认关。
+    pub enabled: bool,
+    /// 用哪家的模型。各家的 Key 和模型存在同目录的 ai.toml 里，见 [`AiFile`](crate::AiFile)。
+    pub provider: AiProvider,
+}
+
+/// AI 预测选词用哪家的模型。接口地址和能选的模型在 kyme-ai 里，自定义的自己填地址。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AiProvider {
+    /// TypeSafe 的 Jev：只在给的选项里挑，还给出把握有多大。
+    #[default]
+    TypeSafe,
+    Anthropic,
+    OpenAi,
+    DeepSeek,
+    /// 阿里云百炼的通义千问。
+    Qwen,
+    Kimi,
+    /// 智谱的 GLM。
+    Zhipu,
+    OpenRouter,
+    /// 别的 OpenAI 兼容的接口，自己填地址：Ollama、LM Studio、自己搭的转发等。
+    Custom,
+}
+
+impl AiProvider {
+    pub const ALL: [AiProvider; 9] = [
+        AiProvider::TypeSafe,
+        AiProvider::Anthropic,
+        AiProvider::OpenAi,
+        AiProvider::DeepSeek,
+        AiProvider::Qwen,
+        AiProvider::Kimi,
+        AiProvider::Zhipu,
+        AiProvider::OpenRouter,
+        AiProvider::Custom,
+    ];
+
+    /// 设置文件里的写法。
+    pub fn id(self) -> &'static str {
+        match self {
+            AiProvider::TypeSafe => "typesafe",
+            AiProvider::Anthropic => "anthropic",
+            AiProvider::OpenAi => "openai",
+            AiProvider::DeepSeek => "deepseek",
+            AiProvider::Qwen => "qwen",
+            AiProvider::Kimi => "kimi",
+            AiProvider::Zhipu => "zhipu",
+            AiProvider::OpenRouter => "openrouter",
+            AiProvider::Custom => "custom",
+        }
+    }
+
+    /// 界面上显示的名字。
+    pub fn name(self) -> &'static str {
+        match self {
+            AiProvider::TypeSafe => "TypeSafe",
+            AiProvider::Anthropic => "Anthropic",
+            AiProvider::OpenAi => "OpenAI",
+            AiProvider::DeepSeek => "DeepSeek",
+            AiProvider::Qwen => "通义千问",
+            AiProvider::Kimi => "Kimi",
+            AiProvider::Zhipu => "智谱",
+            AiProvider::OpenRouter => "OpenRouter",
+            AiProvider::Custom => "自定义",
+        }
     }
 }
 
@@ -120,6 +195,14 @@ font_size = 15
 font_family = ""
 # 选中候选的高亮颜色（#RRGGBB）
 highlight_color = "#5E5CE6"
+
+[ai]
+# AI 预测选词：打字停下来时，把光标前的文字和几个候选整句发给下面这家的模型，让它挑接得最顺的一句，
+# 放在第一个、标 ✨
+enabled = false
+# 用哪家：typesafe、anthropic、openai、deepseek、qwen（通义千问）、kimi、zhipu（智谱）、openrouter，
+# 或者 custom（自己填地址的 OpenAI 兼容接口）。Key 和模型在设置窗口里填，存在同目录的 ai.toml
+provider = "typesafe"
 "##;
 
 /// 磁盘上的设置文件。
@@ -151,7 +234,7 @@ impl SettingsFile {
         }
         self.modified = modified;
         let result = match fs::read_to_string(&self.path) {
-            Ok(text) => Settings::from_toml(&text).map_err(|err| invalid(&text, err.span(), err.message())),
+            Ok(text) => Settings::from_toml(&text).map_err(|err| invalid("设置文件", &text, err.span(), err.message())),
             Err(err) => Err(format!("读不了设置文件：{err}")),
         };
         Some(result)
@@ -166,9 +249,9 @@ impl SettingsFile {
             Err(err) => return Err(format!("读不了设置文件：{err}")),
         };
         // 有一项写错时输入法用的是整套默认设置，这时写回去会把其余写对的项也盖成默认值
-        Settings::from_toml(&text).map_err(|err| invalid(&text, err.span(), err.message()))?;
+        Settings::from_toml(&text).map_err(|err| invalid("设置文件", &text, err.span(), err.message()))?;
         let mut doc: DocumentMut =
-            text.parse().map_err(|err: toml_edit::TomlError| invalid(&text, err.span(), err.message()))?;
+            text.parse().map_err(|err: toml_edit::TomlError| invalid("设置文件", &text, err.span(), err.message()))?;
         // 每一节的每一项都写回去，以后加了设置项这里不用改
         let fresh = toml_edit::ser::to_document(settings).map_err(|err| format!("设置转不成 TOML：{err}"))?;
         for (section, table) in fresh.iter() {
@@ -191,10 +274,10 @@ impl SettingsFile {
 }
 
 /// TOML 的报错带着原文和箭头，有好几行。界面和日志只要一行：第几行，什么问题。
-fn invalid(text: &str, span: Option<Range<usize>>, message: &str) -> String {
+pub(crate) fn invalid(file: &str, text: &str, span: Option<Range<usize>>, message: &str) -> String {
     let line = span.and_then(|span| text.get(..span.start)).map_or(1, |before| before.matches('\n').count() + 1);
     let reason: Vec<&str> = message.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
-    format!("设置文件第 {line} 行写得不对：{}", reason.join("，"))
+    format!("{file}第 {line} 行写得不对：{}", reason.join("，"))
 }
 
 /// 没有小数的数写成整数：字号写 15，和模板一样，不写成 15.0。
@@ -247,6 +330,17 @@ mod tests {
         assert_eq!(settings.input.page_size, 10);
         assert_eq!(settings.appearance.font_size, 12.0);
         assert_eq!(Settings::from_toml("[input]\npage_size = 3").unwrap().input.page_size, 5);
+    }
+
+    #[test]
+    fn ai_providers() {
+        let parse = |s: &str| Settings::from_toml(&format!("[ai]\nprovider = \"{s}\""));
+        assert_eq!(parse("deepseek").unwrap().ai.provider, AiProvider::DeepSeek);
+        assert_eq!(parse("custom").unwrap().ai.provider, AiProvider::Custom);
+        assert!(parse("gemini").is_err());
+        for provider in AiProvider::ALL {
+            assert_eq!(parse(provider.id()).unwrap().ai.provider, provider, "id 和设置文件里的写法一样");
+        }
     }
 
     #[test]

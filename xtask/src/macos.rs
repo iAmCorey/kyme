@@ -24,6 +24,8 @@ use crate::{Context, bundle, util};
 const PLACEHOLDER: &str = "\u{3000}";
 /// 中英提示显示多久（state.rs 里是 1500ms）。等它消失了再检查候选窗有没有收起来。
 const HINT: Duration = Duration::from_millis(1600);
+/// 中英提示出来后这么久之内，接着打字它也该还在。留点余量，机器慢时不误报。
+const HINT_STAYS: Duration = Duration::from_millis(1000);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 发给 `Kyme --qa` 的指令，和 crates/kyme-macos/src/qa.rs 里的一致。
@@ -73,7 +75,7 @@ fn test(ctx: &mut Context) -> Result<Outcome, String> {
     let gates = &ctx.gates.macos;
     let mut details = Vec::new();
     timings.sort();
-    let at = |q: f64| timings.get(((timings.len().saturating_sub(1)) as f64 * q).round() as usize).copied();
+    let at = |q: f64| util::percentile(&timings, q);
     if let (Some(p95), Some(slowest)) = (at(0.95), at(1.0)) {
         details.push(format!(
             "按键处理 p95 {}（门槛 {}ms），最慢一次 {}，共 {} 次",
@@ -111,6 +113,8 @@ fn play(
     kyme.request(&Request::Clear)?;
     let mut inserted = String::new();
     let mut toggled = None;
+    // 中英提示正显示着：切换以后还没开始组字
+    let mut hint: Option<Instant> = None;
     let mut mismatch = None;
     let mut step = 0;
     for stroke in &scenario.strokes {
@@ -138,12 +142,25 @@ fn play(
         step += 1;
         if response.mode_changed.is_some() {
             toggled = Some(Instant::now());
+            hint = toggled;
+        }
+        // 开始组字后，提示换成了候选窗
+        if matches!(oracle.view(), View::Composing { .. }) {
+            hint = None;
         }
         if let Some(text) = &response.commit {
             inserted.push_str(text);
         }
         if let Err(problem) = compare(&state, handled, &inserted, oracle) {
             mismatch = Some(format!("第 {step} 步 {label} 之后：{problem}"));
+            break;
+        }
+        // 切到英文后接着打字，中英提示不能一打字就没了
+        if hint.is_some_and(|at| at.elapsed() < HINT_STAYS)
+            && matches!(oracle.view(), View::Idle)
+            && state.panel.is_none()
+        {
+            mismatch = Some(format!("第 {step} 步 {label} 之后：中英提示还没到时间就收起了"));
             break;
         }
     }

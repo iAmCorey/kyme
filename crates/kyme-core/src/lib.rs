@@ -3,6 +3,7 @@
 //! 平台层（macOS 的 IMK，之后的 TSF / fcitx5）只负责把系统按键翻译成 [`Key`]，
 //! 再把 [`Response`] 交给系统和候选窗。
 
+mod ai_file;
 mod dicts;
 mod disk;
 mod import;
@@ -11,10 +12,12 @@ mod session;
 mod settings;
 mod userdict;
 
+pub use ai_file::{AiFile, AiService, AiServices};
 pub use dicts::{Imported, LocalDicts, LocalWord, read_sources};
 pub use kyme_pinyin as pinyin;
-pub use session::{Key, Mode, Modifiers, Panel, Pick, Response, SELECT_KEYS, Session, View};
+pub use session::{AiQuery, Key, Mode, Modifiers, Panel, Pick, Response, SELECT_KEYS, Session, View};
 pub use settings::{
-    AppearanceSettings, FONT_SIZES, InputSettings, PAGE_SIZES, Rgb, SETTINGS_TEMPLATE, Settings, SettingsFile,
+    AiProvider, AiSettings, AppearanceSettings, FONT_SIZES, InputSettings, PAGE_SIZES, Rgb, SETTINGS_TEMPLATE,
+    Settings, SettingsFile,
 };
 pub use userdict::{UserDictFile, today};

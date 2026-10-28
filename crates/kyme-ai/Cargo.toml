@@ -1,0 +1,13 @@
+[package]
+name = "kyme-ai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# AI 组句。只有这个 crate 联网：输入会话（kyme-core）不碰网络，cargo xtask qa 也不跑它
+
+[dependencies]
+kyme-core = { path = "../kyme-core" }
+# 跟着系统代理走（各家的接口多在国外），证书用系统的
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots", "macos-system-configuration"] }
+serde_json = "1.0.154"

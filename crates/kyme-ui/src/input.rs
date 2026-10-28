@@ -1,14 +1,15 @@
-//! 单行输入框，设置窗口里加词用。照 GPUI 自带的输入框示例改的：光标按字移动，支持输入法组字、鼠标选择、
-//! 复制粘贴。回车是 `Submit`，输入框自己不处理，交给外面的界面。
+//! 单行输入框，设置窗口里加词、填 AI 的设置用。照 GPUI 自带的输入框示例改的：光标按字移动，支持输入法组字、
+//! 鼠标选择、复制粘贴。回车是 `Submit`，输入框自己不处理，交给外面的界面；内容改了发 `Edited`。
+//! `secret` 的输入框像密码框那样只显示圆点，也不让复制。
 
 use std::ops::Range;
 
 use gpui::prelude::*;
 use gpui::{
     App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, ElementId, ElementInputHandler, EntityInputHandler,
-    FocusHandle, GlobalElementId, Hsla, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle,
-    Window, actions, div, fill, point, px, relative, size,
+    EventEmitter, FocusHandle, GlobalElementId, Hsla, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine, SharedString, Style, TextRun, UTF16Selection,
+    UnderlineStyle, Window, actions, div, fill, point, px, relative, size,
 };
 
 actions!(
@@ -18,8 +19,14 @@ actions!(
 
 /// 输入框的按键只在这个上下文里生效，不影响窗口别处的快捷键。
 const CONTEXT: &str = "TextField";
-const HEIGHT: f32 = 28.0;
+/// 输入框的高度，设置窗口里的下拉框也用它，两样放在一列里一样高。
+pub(crate) const HEIGHT: f32 = 28.0;
 const CURSOR_WIDTH: f32 = 1.5;
+/// `secret` 的输入框里每个字显示成一个圆点。
+const MASK: char = '•';
+
+/// 用户改了输入框里的字（打字、粘贴、删除、输入法组字）。`set_text` 改的不算。
+pub struct Edited;
 
 /// 输入框的按键，开窗口前绑一次。`secondary` 在 macOS 上是 ⌘，别的系统是 Ctrl。
 pub fn bind_keys(cx: &mut App) {
@@ -59,6 +66,8 @@ pub struct TextField {
     content: String,
     placeholder: SharedString,
     pub colors: FieldColors,
+    /// 像密码框那样只显示圆点，不让复制、剪切。
+    pub secret: bool,
     /// 选中的范围，按字节算。没选中时是光标的位置。
     selected: Range<usize>,
     /// 光标在选中范围的开头（从后往前选的）。
@@ -80,6 +89,7 @@ impl TextField {
             content: String::new(),
             placeholder: placeholder.into(),
             colors: FieldColors::default(),
+            secret: false,
             selected: 0..0,
             reversed: false,
             marked: None,
@@ -95,10 +105,20 @@ impl TextField {
     }
 
     pub fn clear(&mut self, cx: &mut Context<Self>) {
-        self.content.clear();
-        self.selected = 0..0;
+        self.set_text("", cx);
+    }
+
+    /// 换掉全部内容，光标放到最后。不发 `Edited`。
+    pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.content = text.to_string();
+        self.selected = self.content.len()..self.content.len();
         self.reversed = false;
         self.marked = None;
+        cx.notify();
+    }
+
+    pub fn set_placeholder(&mut self, placeholder: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.placeholder = placeholder.into();
         cx.notify();
     }
 
@@ -164,13 +184,13 @@ impl TextField {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected.is_empty() {
+        if !self.selected.is_empty() && !self.secret {
             cx.write_to_clipboard(ClipboardItem::new_string(self.content[self.selected.clone()].to_string()));
         }
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected.is_empty() {
+        if !self.selected.is_empty() && !self.secret {
             cx.write_to_clipboard(ClipboardItem::new_string(self.content[self.selected.clone()].to_string()));
             self.replace_text_in_range(None, "", window, cx);
         }
@@ -226,7 +246,29 @@ impl TextField {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
-        line.closest_index_for_x(position.x - bounds.left() + self.scroll)
+        self.content_offset(line.closest_index_for_x(position.x - bounds.left() + self.scroll))
+    }
+
+    /// 显示出来的字：`secret` 时每个字换成一个圆点。
+    fn shown(&self) -> SharedString {
+        if self.secret {
+            MASK.to_string().repeat(self.content.chars().count()).into()
+        } else {
+            self.content.clone().into()
+        }
+    }
+
+    /// 内容里的下标（字节）换成显示出来的字里的下标。
+    fn shown_offset(&self, offset: usize) -> usize {
+        if self.secret { self.content[..offset].chars().count() * MASK.len_utf8() } else { offset }
+    }
+
+    /// 显示出来的字里的下标换回内容里的下标。
+    fn content_offset(&self, offset: usize) -> usize {
+        if !self.secret {
+            return offset;
+        }
+        self.content.char_indices().nth(offset / MASK.len_utf8()).map_or(self.content.len(), |(at, _)| at)
     }
 
     fn previous_boundary(&self, offset: usize) -> usize {
@@ -275,6 +317,10 @@ impl EntityInputHandler for TextField {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
+        // 只显示圆点的（API Key）不让输入法读里面的字：AI 预测选词会把光标前的字发给服务商
+        if self.secret {
+            return None;
+        }
         let range = self.range_from_utf16(&range_utf16);
         actual_range.replace(self.range_to_utf16(&range));
         Some(self.content[range].to_string())
@@ -304,6 +350,7 @@ impl EntityInputHandler for TextField {
         self.selected = range.start + new_text.len()..range.start + new_text.len();
         self.reversed = false;
         self.marked = None;
+        cx.emit(Edited);
         cx.notify();
     }
 
@@ -325,6 +372,7 @@ impl EntityInputHandler for TextField {
             None => range.start + new_text.len()..range.start + new_text.len(),
         };
         self.reversed = false;
+        cx.emit(Edited);
         cx.notify();
     }
 
@@ -339,8 +387,8 @@ impl EntityInputHandler for TextField {
         let range = self.range_from_utf16(&range_utf16);
         let left = bounds.left() - self.scroll;
         Some(Bounds::from_corners(
-            point(left + layout.x_for_index(range.start), bounds.top()),
-            point(left + layout.x_for_index(range.end), bounds.bottom()),
+            point(left + layout.x_for_index(self.shown_offset(range.start)), bounds.top()),
+            point(left + layout.x_for_index(self.shown_offset(range.end)), bounds.bottom()),
         ))
     }
 
@@ -351,10 +399,12 @@ impl EntityInputHandler for TextField {
         _: &mut Context<Self>,
     ) -> Option<usize> {
         let local = self.last_bounds?.localize(&point)?;
-        let index = self.last_layout.as_ref()?.index_for_x(local.x + self.scroll)?;
+        let index = self.content_offset(self.last_layout.as_ref()?.index_for_x(local.x + self.scroll)?);
         (!self.content.is_empty()).then(|| self.offset_to_utf16(index.min(self.content.len())))
     }
 }
+
+impl EventEmitter<Edited> for TextField {}
 
 impl Render for TextField {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -454,7 +504,7 @@ impl Element for TextElement {
         let (text, color) = if field.content.is_empty() {
             (field.placeholder.clone(), field.colors.placeholder)
         } else {
-            (SharedString::from(field.content.clone()), style.color)
+            (field.shown(), style.color)
         };
         let run = TextRun {
             len: text.len(),
@@ -465,7 +515,9 @@ impl Element for TextElement {
             strikethrough: None,
         };
         // 输入法正在组的字加下划线
-        let runs = match &field.marked {
+        let marked =
+            field.marked.as_ref().map(|marked| field.shown_offset(marked.start)..field.shown_offset(marked.end));
+        let runs = match &marked {
             Some(marked) => [
                 TextRun { len: marked.start, ..run.clone() },
                 TextRun {
@@ -483,10 +535,11 @@ impl Element for TextElement {
         let font_size = style.font_size.to_pixels(window.rem_size());
         let line = window.text_system().shape_line(text, font_size, &runs, None);
         // 字比输入框长时往左滚，让光标留在看得见的地方；删短了再滚回来
-        let cursor_x = if field.content.is_empty() { px(0.) } else { line.x_for_index(field.cursor()) };
+        let cursor_x =
+            if field.content.is_empty() { px(0.) } else { line.x_for_index(field.shown_offset(field.cursor())) };
         let room = bounds.size.width - px(CURSOR_WIDTH);
         let scroll = field.scroll.min(cursor_x).max(cursor_x - room).min((line.width - room).max(px(0.))).max(px(0.));
-        let x = |offset: usize| bounds.left() - scroll + line.x_for_index(offset);
+        let x = |offset: usize| bounds.left() - scroll + line.x_for_index(field.shown_offset(offset));
         let (cursor, selection) = if field.selected.is_empty() {
             let at = point(bounds.left() - scroll + cursor_x, bounds.top());
             (Some(fill(Bounds::new(at, size(px(CURSOR_WIDTH), bounds.size.height)), field.colors.accent)), None)

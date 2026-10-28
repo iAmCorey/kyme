@@ -10,6 +10,7 @@ core-foundation = "0.10"
 core-graphics = "0.24"
 dispatch2 = "0.3.1"
 gpui.workspace = true
+kyme-ai = { path = "../kyme-ai" }
 kyme-core = { path = "../kyme-core" }
 kyme-ui = { path = "../kyme-ui" }
 log = "0.4"

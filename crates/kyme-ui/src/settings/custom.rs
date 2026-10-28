@@ -6,18 +6,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::prelude::*;
-use gpui::{App, ClickEvent, Context, Div, Entity, EventEmitter, Hsla, Render, Stateful, Window, div, px};
+use gpui::{App, ClickEvent, Context, Div, Entity, Hsla, Render, Stateful, Window, div, px};
 use kyme_core::pinyin::Engine;
 use kyme_core::{LocalDicts, LocalWord, Rgb};
 
-use super::{MARGIN, Palette, card, link, note, open_text, row};
-use crate::input::{FieldColors, Submit, TextField};
+use super::{MARGIN, Palette, card, field_colors, link, note, open_text, row};
+use crate::input::{Submit, TextField};
 
 /// 词那一列的宽度。
 const WORD_WIDTH: f32 = 150.0;
-
-/// 点了「‹ 设置」。
-pub(super) struct Back;
 
 pub(super) struct CustomWordsView {
     dicts: LocalDicts,
@@ -33,12 +30,10 @@ pub(super) struct CustomWordsView {
     pub(super) accent: Rgb,
 }
 
-impl EventEmitter<Back> for CustomWordsView {}
-
 impl CustomWordsView {
     /// 词由调用方接着 `reload` 读进来。
     pub(super) fn new(dicts: LocalDicts, dict_dir: Option<PathBuf>, accent: Rgb, cx: &mut Context<Self>) -> Self {
-        let word = cx.new(|cx| TextField::new("词", cx));
+        let word = cx.new(|cx| TextField::new("加个词，比如：曾小贤 zengxiaoxian", cx));
         if let Some(dir) = dict_dir {
             cx.spawn(async move |view, cx| {
                 let engine = cx.background_executor().spawn(async move { Engine::load_dir(&dir).ok() }).await;
@@ -136,8 +131,6 @@ impl Render for CustomWordsView {
         let p = Palette::new(window.appearance(), self.accent);
         let colors = field_colors(&p);
         self.word.update(cx, |field, _| field.colors = colors);
-        let back =
-            link("back", "‹ 设置", p.theme.accent).on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(Back)));
         let add =
             button(&p, "add", "添加").on_click(cx.listener(|view, _: &ClickEvent, window, cx| view.add(window, cx)));
         let error = self.error.clone().map(|err| note(&p, err).text_color(p.error));
@@ -169,9 +162,8 @@ impl Render for CustomWordsView {
             .pb(px(16.0))
             .flex()
             .flex_col()
-            .child(div().h(px(28.0)).flex().items_center().px(px(4.0)).child(back))
             .child(div().flex().items_center().gap(px(8.0)).child(div().flex_1().child(self.word.clone())).child(add))
-            .child(div().h(px(32.0)).flex().items_center().px(px(4.0)).children(error))
+            .child(div().min_h(px(16.0)).py(px(8.0)).px(px(4.0)).children(error))
             .child(list)
             .child(
                 div()
@@ -183,16 +175,6 @@ impl Render for CustomWordsView {
                     .child(open)
                     .child(note(&p, format!("{} 个词", self.words.len()))),
             )
-    }
-}
-
-fn field_colors(p: &Palette) -> FieldColors {
-    FieldColors {
-        text: p.theme.primary,
-        placeholder: p.theme.secondary,
-        accent: p.theme.accent,
-        background: p.card,
-        border: p.line,
     }
 }
 

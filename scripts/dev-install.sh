@@ -9,9 +9,11 @@ DEST="$HOME/Library/Input Methods/Kyme.app"
 
 scripts/build-app.sh
 
-# 系统会在需要时重新拉起输入法进程
 pkill -x Kyme || true
 rm -rf "$DEST"
 cp -R "$APP" "$DEST"
 "$DEST/Contents/MacOS/Kyme" --install "$@"
+# 旧进程关掉后，系统不会因为打字就把输入法重新拉起来，要等打开输入法菜单这类动作，
+# 在那之前打什么都没反应。装好就先拉起来。已经被系统拉起来了就不再开：再开一次是打开设置窗口
+pgrep -x Kyme > /dev/null || open -g "$DEST"
 echo "已安装：$DEST"

@@ -7,7 +7,6 @@
 //!
 //! eval/pending.tsv（可选，格式相同）放暂时还做不到的用例：只报告不卡发版，哪条做到了会提示挪过去。
 
-use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -26,20 +25,8 @@ struct Case {
 }
 
 fn load(path: &Path) -> Result<Vec<Case>, String> {
-    let text = fs::read_to_string(path).map_err(|err| format!("读不了 {}：{err}", path.display()))?;
-    text.lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty() && !line.starts_with('#'))
-        .map(|(index, line)| {
-            let mut cols = line.split('\t');
-            match (cols.next(), cols.next(), cols.next()) {
-                (Some(category), Some(input), Some(expected)) => {
-                    Ok(Case { category: category.into(), input: input.into(), expected: expected.into() })
-                }
-                _ => Err(format!("{} 第 {} 行要有类别、输入、期望三列，用 Tab 分隔", path.display(), index + 1)),
-            }
-        })
-        .collect()
+    let rows = util::tsv(path, "类别、输入、期望三列")?;
+    Ok(rows.into_iter().map(|[category, input, expected]| Case { category, input, expected }).collect())
 }
 
 struct Evaluation {

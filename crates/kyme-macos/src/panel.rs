@@ -23,6 +23,8 @@ pub(crate) const DEFAULT_FONT: &str = "PingFang SC";
 pub struct PanelWindow {
     handle: WindowHandle<CandidateView>,
     window: Retained<NSWindow>,
+    /// 最近一次显示的是中英提示，不是候选。
+    hint: bool,
 }
 
 impl PanelWindow {
@@ -59,10 +61,11 @@ impl PanelWindow {
         let level = CGWindowLevelForKey(CGWindowLevelKey::CursorWindowLevelKey) - 100;
         window.setLevel(level as isize);
         window.setHasShadow(true);
-        PanelWindow { handle, window }
+        PanelWindow { handle, window, hint: false }
     }
 
     pub fn show(&mut self, app: &AsyncApp, content: Content, appearance: &AppearanceSettings, caret: NSRect) {
+        let hint = matches!(content, Content::Mode(_));
         let handle = self.handle;
         let appearance = appearance.clone();
         let measured = app.update(|cx| {
@@ -89,6 +92,12 @@ impl PanelWindow {
         if !self.window.isVisible() {
             self.window.orderFront(None);
         }
+        self.hint = hint;
+    }
+
+    /// 正显示着中英提示。
+    pub fn showing_hint(&self) -> bool {
+        self.hint && self.window.isVisible()
     }
 
     pub fn visible_frame(&self) -> Option<NSRect> {
@@ -96,6 +105,7 @@ impl PanelWindow {
     }
 
     pub fn hide(&mut self) {
+        self.hint = false;
         if self.window.isVisible() {
             self.window.orderOut(None);
         }

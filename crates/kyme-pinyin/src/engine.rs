@@ -7,6 +7,7 @@ use std::sync::Arc;
 use crate::dict::{Dictionary, LoadError, dict_files, read_file};
 use crate::emoji::Emoji;
 use crate::local;
+use crate::pairs::Pairs;
 use crate::syllable::{SylId, SylSet, SyllableTable};
 use crate::user::UserDict;
 
@@ -20,8 +21,11 @@ const ABBR_PENALTY: f64 = 1.5;
 const ABBR_SYLLABLE_PENALTY: f64 = 3.0;
 /// 末尾音节还没打完时的惩罚。
 const PARTIAL_PENALTY: f64 = 1.0;
-/// 末尾已经是完整音节、却按更长的音节去联想时的惩罚。
-const PARTIAL_COMPLETE_PENALTY: f64 = 4.0;
+/// 末尾已经是完整音节、却按更长的音节去联想时的惩罚。打完整的音节多半就是想要它：meine 是「没呢」，
+/// 不该把 ne 联想成 neng 出「没能」。照着打的读法（判断要不要纠错时的参照）罚得轻一些：
+/// 罚重了它就变贵，纠错更容易赢，打对的拼音更容易被改。
+const PARTIAL_COMPLETE_PENALTY: f64 = 6.0;
+const PARTIAL_COMPLETE_LITERAL_PENALTY: f64 = 4.0;
 /// 各种打字错误按纠正后的音节算，再加这么多惩罚。
 const SWAP_PENALTY: f64 = 2.5;
 const CROSS_SWAP_PENALTY: f64 = 3.0;
@@ -48,6 +52,8 @@ const RAW_COST: f64 = 40.0;
 const LATTICE_WIDTH: usize = 3;
 /// 候选列表的上限。
 const MAX_CANDIDATES: usize = 60;
+/// 首选看搭配换字时，比较前几句。
+const COLLOCATION_SENTENCES: usize = 8;
 /// 不带用户词库时用的空词库。
 static NO_USER_WORDS: UserDict = UserDict::empty();
 
@@ -318,6 +324,26 @@ impl<'a> Words<'a> {
     }
 }
 
+/// 词图上走到某个位置的一条路：代价，从哪个位置的第几条路走过来，这一步是哪个词（分隔符那一步没有词），
+/// 和到这里为止的最后一个字，接下一个词时看搭配用。
+#[derive(Clone, Copy)]
+struct Route {
+    cost: f64,
+    from: usize,
+    rank: usize,
+    word: Option<Word>,
+    last: Option<char>,
+}
+
+/// `sentences` 里往后走的一步：走到哪、代价多少。
+#[derive(Clone, Copy)]
+struct Hop {
+    to: usize,
+    cost: f64,
+    /// 哪个词，和它的头尾两个字，接词时看搭配用。分隔符那一步没有词
+    word: Option<(Word, char, char)>,
+}
+
 /// 组句路径上的一步。
 #[derive(Clone)]
 enum Step {
@@ -331,11 +357,14 @@ pub struct Engine {
     /// 本地词库：自定义词库和导入的外部词库。和用户词一样只用在照着打的读法上。
     local: Dictionary,
     emoji: Arc<Emoji>,
+    /// 主词库里字和字的搭配，组句时看相邻两个词接得顺不顺。
+    pairs: Arc<Pairs>,
 }
 
 impl Engine {
     pub fn new(dict: Dictionary) -> Self {
-        Engine { dict: Arc::new(dict), local: Dictionary::from_rime_sources(&[]), emoji: Arc::default() }
+        let pairs = Arc::new(Pairs::new(&dict));
+        Engine { dict: Arc::new(dict), local: Dictionary::from_rime_sources(&[]), emoji: Arc::default(), pairs }
     }
 
     /// 读一个数据目录：全部 `.dict.yaml`（按文件名排序）和 emoji 对照表 `emoji.txt`。
@@ -356,7 +385,12 @@ impl Engine {
     /// 换上一套本地词库，每份是一个词库文件的内容（写法见 `local::parse_line`）。主词库和 emoji 不动，
     /// 和这个引擎共用。没写拼音、拼音对不上的词按主词库补读音，补不出来的不要。
     pub fn with_local(&self, sources: &[&str]) -> Engine {
-        Engine { dict: self.dict.clone(), local: local::build(&self.dict, sources), emoji: self.emoji.clone() }
+        Engine {
+            dict: self.dict.clone(),
+            local: local::build(&self.dict, sources),
+            emoji: self.emoji.clone(),
+            pairs: self.pairs.clone(),
+        }
     }
 
     pub fn dictionary(&self) -> &Dictionary {
@@ -384,6 +418,130 @@ impl Engine {
         &self.emoji
     }
 
+    /// 前 `count` 个最合适的整句，最好的在前，文字各不相同。只看照着打的读法和简拼，不纠错；拼不通、
+    /// 要原样保留字母的输入没有整句。和 `convert_with` 一样按词频组句，再算上相邻两个词接得顺不顺。
+    /// AI 在这些整句里挑接得上前文的那句。
+    pub fn sentences(&self, input: &str, user: &UserDict, count: usize) -> Vec<Candidate> {
+        self.ranked_sentences(input, Words::All(user), count)
+    }
+
+    /// `sentences` 的实现，用 `words` 里的词。
+    fn ranked_sentences(&self, input: &str, words: Words, count: usize) -> Vec<Candidate> {
+        let user = words.user();
+        let bytes = input.as_bytes();
+        let n = bytes.len();
+        let keep = count * 2;
+        let options: Vec<Vec<Choice>> = (0..n).map(|pos| self.seg_options(input, pos, Reading::Plain)).collect();
+        self.k_best(user, n, count, n, |i| {
+            if bytes[i] == b'\'' {
+                return vec![Hop { to: i + 1, cost: 0.0, word: None }];
+            }
+            let mut hops = Vec::new();
+            for span in self.spans_from(input, &options, i, words) {
+                for (word, cost) in self.lookup(&span, keep, words.for_span(&span)) {
+                    hops.extend(self.hop(user, span.end, step_cost(cost, &span), word));
+                }
+            }
+            hops
+        })
+    }
+
+    /// 读音是 `syllables` 的前 `count` 句，最好的在前：只换字、不换读音，给 `with_collocations` 挑首选。
+    /// 位置按音节数，选中时消耗 `consumed` 个字节。
+    fn same_reading(&self, syllables: &[SylId], words: Words, count: usize, consumed: usize) -> Vec<Candidate> {
+        let user = words.user();
+        let keep = count * 2;
+        self.k_best(user, syllables.len(), count, consumed, |i| {
+            let mut hops = Vec::new();
+            let mut segs = Vec::new();
+            for (j, &id) in syllables.iter().enumerate().skip(i).take(MAX_WORD_SYLS) {
+                segs.push(Seg::exact(i, j + 1, id));
+                // 词库里没有以这几个音节开头的词，再长也不会有
+                if !self.has_words_starting_with(&segs, words) {
+                    break;
+                }
+                let span = Span { end: j + 1, segs: segs.clone(), penalty: 0.0 };
+                for (word, cost) in self.lookup(&span, keep, words) {
+                    hops.extend(self.hop(user, span.end, step_cost(cost, &span), word));
+                }
+            }
+            hops
+        })
+    }
+
+    /// 走到 `to` 的一步，选了 `word`：记下这个词的头尾两个字，接词时看搭配用。文字是空的词不要。
+    fn hop(&self, user: &UserDict, to: usize, cost: f64, word: Word) -> Option<Hop> {
+        let text = self.word_text(user, word);
+        Some(Hop { to, cost, word: Some((word, text.chars().next()?, text.chars().next_back()?)) })
+    }
+
+    /// 词图上从位置 0 走到 `n` 的前 `count` 条路，算上相邻两个词接得顺不顺（见 `Pairs`），最好的在前，文字各不相同。
+    /// `hops(i)` 是从位置 `i` 往后走的每一步，选中整句时消耗 `consumed` 个字节。
+    fn k_best(
+        &self,
+        user: &UserDict,
+        n: usize,
+        count: usize,
+        consumed: usize,
+        hops: impl Fn(usize) -> Vec<Hop>,
+    ) -> Vec<Candidate> {
+        // 同一句话可能有几种切法，多留一些路，去掉重复的以后还够数
+        let keep = count * 2;
+        // paths[i]：走到位置 i 代价最小的几条路，按代价排好
+        let mut paths: Vec<Vec<Route>> = vec![Vec::new(); n + 1];
+        paths[0].push(Route { cost: 0.0, from: 0, rank: 0, word: None, last: None });
+        for i in 0..n {
+            if paths[i].is_empty() {
+                continue;
+            }
+            let hops = hops(i);
+            for rank in 0..paths[i].len() {
+                let from = paths[i][rank];
+                for &Hop { to, cost, word } in &hops {
+                    let mut cost = from.cost + cost;
+                    // 搭配的代价不会是负的：不算它都挤不进前几名，就不用查了
+                    if paths[to].len() == keep && paths[to][keep - 1].cost <= cost {
+                        continue;
+                    }
+                    if let (Some(before), Some((_, first, _))) = (from.last, word) {
+                        cost += self.pairs.cost(before, first);
+                    }
+                    let at = paths[to].partition_point(|route| route.cost <= cost);
+                    if at < keep {
+                        let (word, last) = match word {
+                            Some((word, _, last)) => (Some(word), Some(last)),
+                            None => (None, from.last),
+                        };
+                        paths[to].insert(at, Route { cost, from: i, rank, word, last });
+                        paths[to].truncate(keep);
+                    }
+                }
+            }
+        }
+        let mut seen = HashSet::new();
+        let mut sentences = Vec::new();
+        for rank in 0..paths[n].len() {
+            let mut picked = Vec::new();
+            let (mut at, mut rank) = (n, rank);
+            while at > 0 {
+                let route = paths[at][rank];
+                picked.extend(route.word);
+                (at, rank) = (route.from, route.rank);
+            }
+            picked.reverse();
+            let text: String = picked.iter().map(|&word| self.word_text(user, word)).collect();
+            if seen.insert(text.clone()) {
+                let syllables =
+                    picked.iter().flat_map(|&word| self.word_syllables(user, word).iter().copied()).collect();
+                sentences.push(Candidate { text, consumed, syllables });
+            }
+            if sentences.len() == count {
+                break;
+            }
+        }
+        sentences
+    }
+
     /// 把一串拼音（小写字母，可用 `'` 分隔）转成候选。第一个候选是整句最优解。
     pub fn convert(&self, input: &str) -> Conversion {
         self.convert_with(input, &NO_USER_WORDS)
@@ -398,11 +556,11 @@ impl Engine {
         let all = Words::All(user);
         // 一个元音都没有是在打简拼（rgzn），不纠错
         if !input.bytes().any(|b| VOWELS.contains(&b)) {
-            return self.solve(input, Reading::Plain, all).conversion;
+            return self.with_collocations(self.solve(input, Reading::Plain, all).conversion, all);
         }
         let best = self.solve(input, Reading::Corrected, all);
         if !best.corrected {
-            return best.conversion;
+            return self.with_collocations(best.conversion, all);
         }
         // 用了纠错的话，要比照着打的读法明显更合理才算数（naanni 照着打是 na'an'ni「那按你」，
         // 不能被读成 nan'ni「南宁」）。拼不通的输入只能逐个字母原样保留，照着打的那边代价极高。
@@ -413,23 +571,45 @@ impl Engine {
             self.solve(input, Reading::Corrected, Words::Main)
         };
         if !best.corrected {
-            return self.solve(input, Reading::Plain, all).conversion;
+            return self.with_collocations(self.solve(input, Reading::Plain, all).conversion, all);
         }
         let literal = self.solve(input, Reading::Literal, all);
         if best.cost + TYPO_MARGIN < literal.cost {
-            return best.conversion;
+            // 纠错的整句只用主词库，看搭配换字时也一样
+            return self.with_collocations(best.conversion, Words::Main);
         }
-        let mut plain = self.solve(input, Reading::Plain, all).conversion;
+        let mut conversion = self.with_collocations(self.solve(input, Reading::Plain, all).conversion, all);
         // 照着打的读法以没打完的音节结尾、纠错改的又正是它：分不清是还没打完还是最后一下按错了
         // （suho 可能要接着打 suhong，也可能是想打「说」）。首选按照着打的读法，纠错的整句排第二，按 2 就能选
         let at_tail = matches!((literal.unfinished_from, best.last_fix_end), (Some(tail), Some(end)) if end > tail);
         if at_tail
             && let Some(fixed) = best.conversion.candidates.into_iter().next()
-            && !plain.candidates.iter().any(|c| c.text == fixed.text)
+            && !conversion.candidates.iter().any(|c| c.text == fixed.text)
         {
-            plain.candidates.insert(plain.candidates.len().min(1), fixed);
+            conversion.candidates.insert(conversion.candidates.len().min(1), fixed);
         }
-        plain
+        conversion
+    }
+
+    /// 首选换成读音一样、搭配更顺的那句，原来的首选排第二。只按词频组句的话，「和」比「喝」常用得多，
+    /// haonanhe 组出「好难和」；看搭配，「难喝」常见、「难和」几乎没有，就换成「好难喝」。
+    /// 只在首选的读音（纠过错的是纠正后的）上换字，打的拼音怎么理解不变；`words` 和组出首选时用的一样。
+    fn with_collocations(&self, mut conversion: Conversion, words: Words) -> Conversion {
+        let Some(first) = conversion.candidates.first() else { return conversion };
+        // 一个音节只有一个字，没有词和词接得顺不顺可看；带着原样字母的整句没有读音
+        if first.syllables.len() < 2 {
+            return conversion;
+        }
+        let better = self
+            .same_reading(&first.syllables, words, COLLOCATION_SENTENCES, first.consumed)
+            .into_iter()
+            .next()
+            .filter(|better| better.text != first.text);
+        if let Some(better) = better {
+            conversion.candidates.retain(|candidate| candidate.text != better.text);
+            conversion.candidates.insert(0, better);
+        }
+        conversion
     }
 
     /// 按 `reading` 允许的读法、用 `words` 里的词组出最优整句。纠错得来的那一段总是只用主词库。
@@ -457,7 +637,7 @@ impl Engine {
             let spans = self.spans_from(input, &options, i, words);
             for span in &spans {
                 for (word, word_cost) in self.lookup(span, LATTICE_WIDTH, words.for_span(span)) {
-                    let total = here + word_cost + span.penalty + WORD_PENALTY;
+                    let total = here + step_cost(word_cost, span);
                     relax(&mut cost, &mut back, i, span.end, total, || Step::Word { word, segs: span.segs.clone() });
                 }
             }
@@ -686,7 +866,11 @@ impl Engine {
             if let Some(set) = table.prefix(tail) {
                 let complete = table.exact(tail).is_some();
                 if !complete || set.len() > 1 {
-                    let penalty = if complete { PARTIAL_COMPLETE_PENALTY } else { PARTIAL_PENALTY };
+                    let penalty = match (complete, reading) {
+                        (false, _) => PARTIAL_PENALTY,
+                        (true, Reading::Literal) => PARTIAL_COMPLETE_LITERAL_PENALTY,
+                        (true, _) => PARTIAL_COMPLETE_PENALTY,
+                    };
                     options.push(Choice::single(Seg::prefix(pos, run_end, *set, bytes[pos], penalty)));
                 }
             }
@@ -775,6 +959,11 @@ impl Engine {
             Word::User(learned) => user.syllables(learned),
         }
     }
+}
+
+/// 词图上走一步的代价：词的代价、这一段切法的惩罚，再加每多一个词的惩罚。组句和求前几句都用它，两边算法一样。
+fn step_cost(word_cost: f64, span: &Span) -> f64 {
+    word_cost + span.penalty + WORD_PENALTY
 }
 
 /// 接上一段拼音：前面已经是音节的话，先加一个分隔符。
@@ -921,6 +1110,40 @@ mod tests {
         let mut user = UserDict::default();
         user.learn(&engine, "朋", &syllables(&engine, "peng"), 0);
         assert_eq!(engine.convert_with("peng", &user).candidates[0].text, "朋", "选过一次不该反而掉下去");
+    }
+
+    #[test]
+    fn sentences_are_ranked_and_distinct() {
+        let engine = Engine::new(Dictionary::from_rime_sources(&[
+            "好\thao\t1000\n号\thao\t100\n难\tnan\t900\n男\tnan\t300\n和\the\t1000\n喝\the\t500\n难喝\tnan he\t20\n",
+        ]));
+        let user = UserDict::default();
+        let sentences: Vec<String> = engine.sentences("haonanhe", &user, 5).into_iter().map(|c| c.text).collect();
+        assert_eq!(sentences[0], engine.convert("haonanhe").candidates[0].text, "第一个就是首选");
+        assert!(sentences.contains(&"好难喝".to_string()), "{sentences:?}");
+        assert_eq!(sentences.len(), 5);
+        let mut unique = sentences.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), sentences.len(), "文字各不相同：{sentences:?}");
+        assert!(engine.sentences("vv", &user, 5).is_empty(), "拼不通的没有整句");
+    }
+
+    #[test]
+    fn collocations_pick_among_sentences_that_read_the_same() {
+        // 只看词频是「好难和」（「和」比「喝」常用）；「难喝」常见、「难和」没见过，看搭配换成「好难喝」
+        let engine = Engine::new(Dictionary::from_rime_sources(&[
+            "好\thao\t1000\n难\tnan\t900\n和\the\t1000\n喝\the\t300\n好难\thao nan\t100\n太难喝\ttai nan he\t50000\n",
+        ]));
+        let c = engine.convert("haonanhe");
+        assert_eq!(texts(&c)[..2], ["好难喝", "好难和"], "原来的首选排第二");
+        assert_eq!(c.candidates[0].syllables, syllables(&engine, "hao nan he"));
+        assert_eq!((c.preedit.as_str(), c.spelling.as_str()), ("hao'nan'he", "hao'nan'he"), "读音不变");
+        assert_eq!(engine.sentences("haonanhe", &UserDict::default(), 3)[0].text, "好难喝");
+        let c = engine.convert("haonnahe");
+        assert_eq!(c.spelling, "hao'nan'he", "打反了，纠回来");
+        assert_eq!(texts(&c)[..2], ["好难喝", "好难和"], "纠过错的也看搭配");
+        assert_eq!(c.candidates[0].consumed, "haonnahe".len());
     }
 
     #[test]

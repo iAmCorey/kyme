@@ -1,5 +1,6 @@
-//! 跑外部命令、读 git 状态、格式化耗时之类的小工具。
+//! 跑外部命令、读 git 状态、读用例表、格式化耗时之类的小工具。
 
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -36,6 +37,24 @@ pub fn git_head(root: &Path) -> Option<String> {
 /// 工作区有没有未提交的改动（含未跟踪的文件）。
 pub fn git_dirty(root: &Path) -> bool {
     stdout_of(Command::new("git").args(["status", "--porcelain"]).current_dir(root)).is_some_and(|s| !s.is_empty())
+}
+
+/// 读一个 Tab 分隔的用例表：跳过空行和 `#` 开头的注释，每行取前 `N` 列，不够的报第几行，`columns` 说明各列。
+pub fn tsv<const N: usize>(path: &Path, columns: &str) -> Result<Vec<[String; N]>, String> {
+    let text = fs::read_to_string(path).map_err(|err| format!("读不了 {}：{err}", path.display()))?;
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty() && !line.starts_with('#'))
+        .map(|(index, line)| {
+            let fields: Vec<String> = line.split('\t').take(N).map(String::from).collect();
+            fields.try_into().map_err(|_| format!("{} 第 {} 行要有{columns}，用 Tab 分隔", path.display(), index + 1))
+        })
+        .collect()
+}
+
+/// 排好序的耗时里的第 `q` 分位（0 到 1），空的是 None。
+pub fn percentile(sorted: &[Duration], q: f64) -> Option<Duration> {
+    sorted.get((sorted.len().saturating_sub(1) as f64 * q).round() as usize).copied()
 }
 
 pub fn as_ms(duration: Duration) -> f64 {

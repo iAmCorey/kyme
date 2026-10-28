@@ -3,6 +3,7 @@
 mod input;
 mod settings;
 
+use std::borrow::Cow;
 use std::rc::Rc;
 
 use gpui::prelude::*;
@@ -84,7 +85,7 @@ impl CandidateView {
                     row += m.cell_pad_x * 2.0
                         + width_of(key_label(i), m.index)
                         + m.index_gap
-                        + width_of(text, m.candidate);
+                        + width_of(&shown(panel, i, text), m.candidate);
                 }
                 if panel.has_prev || panel.has_next {
                     row += m.pager;
@@ -108,6 +109,11 @@ fn mode_label(mode: Mode) -> &'static str {
         Mode::Chinese => "中",
         Mode::English => "英",
     }
+}
+
+/// 候选格子里写的字：AI 挑的那句前面加 ✨。
+fn shown<'a>(panel: &Panel, index: usize, text: &'a str) -> Cow<'a, str> {
+    if panel.ai == Some(index) { Cow::Owned(format!("✨{text}")) } else { Cow::Borrowed(text) }
 }
 
 /// 候选前面的序号，也就是选它要按的键。每页最多 `SELECT_KEYS.len()` 个候选。
@@ -279,7 +285,8 @@ impl Render for CandidateView {
                         .gap(px(m.cell_gap))
                         .children(panel.candidates.iter().enumerate().flat_map(|(i, text)| {
                             let line = (panel.emoji == Some(i)).then(|| divider(&theme, &m).into_any_element());
-                            let cell = candidate_cell(&theme, &m, i, text, i == panel.highlighted, &self.on_pick);
+                            let text = shown(panel, i, text);
+                            let cell = candidate_cell(&theme, &m, i, &text, i == panel.highlighted, &self.on_pick);
                             line.into_iter().chain([cell.into_any_element()])
                         }))
                         .when(panel.has_prev || panel.has_next, |row| {

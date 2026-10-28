@@ -6,4 +6,5 @@ license.workspace = true
 
 [dependencies]
 gpui.workspace = true
+kyme-ai = { path = "../kyme-ai" }
 kyme-core = { path = "../kyme-core" }

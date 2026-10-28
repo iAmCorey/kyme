@@ -1,5 +1,6 @@
-//! 设置窗口：上面是候选窗的预览，下面是分成「输入」「外观」「词库」三组的各项。点一下就写进设置文件，
-//! 文件里的注释照旧；输入法切换输入框时读到新设置。「自定义词库」点进去是单独的一页（custom.rs）。
+//! 设置窗口：左边是导航栏，右边是一页设置。「输入」「外观」两页上面是候选窗的预览；「自定义词库」加词、删词
+//! （custom.rs）；「外部词库」导入别家的词库；「AI」选服务商、填 Key。点一下就写进设置文件，文件里的注释照旧；
+//! AI 的 Key、模型和地址写进旁边只有自己能读写的 ai.toml。输入法切换输入框时读到新设置。
 
 mod custom;
 
@@ -8,46 +9,52 @@ use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
-    App, BoxShadow, ClickEvent, Context, Div, ElementId, Entity, FocusHandle, FontWeight, Hsla, PathPromptOptions,
-    Pixels, Render, SharedString, Size, Stateful, Subscription, Window, WindowAppearance, div, font, point, px, rgb,
-    rgba, size, transparent_black,
+    AnyElement, App, BoxShadow, ClickEvent, Context, Deferred, Div, ElementId, Entity, FocusHandle, FontWeight, Hsla,
+    MouseButton, MouseDownEvent, PathPromptOptions, Pixels, Render, SharedString, Size, Stateful, Subscription, Window,
+    WindowAppearance, anchored, deferred, div, font, point, px, rgb, rgba, size, transparent_black,
 };
 use kyme_core::pinyin::{Dictionary, Emoji, Engine};
 use kyme_core::{
-    FONT_SIZES, Imported, Key, LocalDicts, Modifiers, PAGE_SIZES, Rgb, Session, Settings, SettingsFile, UserDictFile,
-    View,
+    AiFile, AiProvider, AiService, AiServices, FONT_SIZES, Imported, Key, LocalDicts, Modifiers, PAGE_SIZES, Rgb,
+    Session, Settings, SettingsFile, UserDictFile, View,
 };
 
-use self::custom::{Back, CustomWordsView};
-use crate::{CandidateView, Content, Metrics, Theme, panel_height};
+use self::custom::CustomWordsView;
+use crate::input::{Edited, FieldColors, HEIGHT as FIELD_HEIGHT, TextField};
+use crate::{CandidateView, Content, Metrics, Theme};
 
-const WIDTH: f32 = 520.0;
-/// 标题栏那一条，红绿灯在里面。
+/// 窗口大小固定，右边那一页放不下时滚动。
+const WIDTH: f32 = 720.0;
+const HEIGHT: f32 = 540.0;
+const SIDEBAR: f32 = 180.0;
+/// 标题栏那一条，红绿灯在里面，导航栏从它下面开始。
 const TITLEBAR: f32 = 32.0;
-/// 窗口左右的留白。
-const MARGIN: f32 = 16.0;
+/// 右边一页的左右留白。
+const MARGIN: f32 = 20.0;
 /// 预览区的内边距。
 const STAGE_PAD: f32 = 16.0;
 /// 预览里模拟的输入框那一行。
 const INPUT_LINE: f32 = 20.0;
 /// 模拟的输入框和候选窗之间的距离。
 const STAGE_GAP: f32 = 8.0;
-/// 分组的标题，连同上方的留白。
-const HEADER: f32 = 32.0;
 const ROW: f32 = 40.0;
-/// 「输入」「外观」「词库」每组固定几项。render 里每组的行按它定长，加了一组或一项忘了改这里会编译不过，
-/// 窗口高度就不会算错。「词库」组下面每个导入过的外部词库再一行，多于 MAX_LISTED 个就在卡片里滚动。
-const SECTION_ROWS: [usize; 3] = [4, 3, 2];
-const MAX_LISTED: usize = 4;
-/// 每组卡片上下各一像素的边框。
-const CARD_BORDER: f32 = 2.0;
-const FOOTER: f32 = 48.0;
+/// 行里输入框、下拉框的宽度。
+const FIELD_WIDTH: f32 = 280.0;
+/// 展开的选项和下拉框之间的空隙。
+const DROPDOWN_GAP: f32 = 4.0;
+/// 模型下拉框最后一项：选了它，下面多一行自己填模型名。
+const OTHER_MODEL: &str = "其他…";
 
 /// 预览打的拼音和用的小词库：打 nihao 时第一页会出现的词，按词频从高到低。
 const PREVIEW_INPUT: &str = "nihao";
 const PREVIEW_DICT: &str = "你好\tni hao\t1000\n你\tni\t900\n拟\tni\t800\n泥\tni\t700\n尼\tni\t600\n\
                             妮\tni\t500\n倪\tni\t400\n霓\tni\t300\n逆\tni\t200\n腻\tni\t100\n";
 const PREVIEW_EMOJI: &str = "你好\t你好 👋\n";
+
+/// 「检查一下」问的例子：看前文是「美食」，引擎的首选是「没事」。例子是定死的，不发打过的字。
+const CHECK_CONTEXT: &str = "周末想去夜市吃点";
+const CHECK_PINYIN: &str = "meishi";
+const CHECK_CANDIDATES: [&str; 3] = ["没事", "美食", "美式"];
 
 /// 字体的选项：设置里写的字体名和显示的名字。只列出这台机器上装了的。
 const FONTS: [(&str, &str); 6] = [
@@ -61,6 +68,63 @@ const FONTS: [(&str, &str); 6] = [
 
 /// 高亮色的选项：系统的几种强调色。
 const COLORS: [u32; 9] = [0x5e5ce6, 0x007aff, 0xaf52de, 0xff2d55, 0xff3b30, 0xff9500, 0xffcc00, 0x34c759, 0x8e8e93];
+
+/// 导航栏里的一页。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Input,
+    Appearance,
+    Custom,
+    Imported,
+    Ai,
+}
+
+impl Page {
+    const ALL: [Page; 5] = [Page::Input, Page::Appearance, Page::Custom, Page::Imported, Page::Ai];
+
+    fn title(self) -> &'static str {
+        match self {
+            Page::Input => "输入",
+            Page::Appearance => "外观",
+            Page::Custom => "自定义词库",
+            Page::Imported => "外部词库",
+            Page::Ai => "AI",
+        }
+    }
+}
+
+/// 「AI」页的三个输入框。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AiField {
+    Model,
+    Endpoint,
+    Key,
+}
+
+impl AiField {
+    const ALL: [AiField; 3] = [AiField::Model, AiField::Endpoint, AiField::Key];
+
+    fn of(self, service: &mut AiService) -> &mut String {
+        match self {
+            AiField::Model => &mut service.model,
+            AiField::Endpoint => &mut service.endpoint,
+            AiField::Key => &mut service.key,
+        }
+    }
+}
+
+/// 「AI」页的两个下拉框。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Menu {
+    Provider,
+    Model,
+}
+
+/// 「检查一下」的进度。在查的那一次记着编号，回来的结果对得上才算数。
+enum Check {
+    Running(u64),
+    Done(Result<(), String>),
+}
 
 /// 要点两次才做的事，点过第一次的是哪一个。
 #[derive(PartialEq)]
@@ -76,7 +140,7 @@ pub struct SettingsView {
     /// 本地词库的目录。外部词库的词数在这里记着，没改过的不再数。
     dicts: LocalDicts,
     settings: Settings,
-    /// 设置文件读不了、写不进去时的说明。
+    /// 设置文件、ai.toml 读不了、写不进去时的说明。
     error: Option<String>,
     default_font: SharedString,
     /// 这台机器上有的字体选项。
@@ -86,43 +150,50 @@ pub struct SettingsView {
     /// 预览的输入框里显示的内容。
     marked: String,
     preview: Entity<CandidateView>,
+    /// 正显示着哪一页。
+    page: Page,
     /// 用户词库里有几个词。
     learned_words: usize,
     /// 点过一次、等着再点一次的操作。
     confirm: Option<Confirm>,
-    /// 自定义词库里有几个词。
-    custom_words: usize,
     /// 安装包里的词库目录，自定义词库页定读音用。
     dict_dir: Option<PathBuf>,
     /// 「自定义词库」页，第一次点进去时建，之后留着：主词库不用再读一遍。
     custom: Option<Entity<CustomWordsView>>,
-    /// 正显示着「自定义词库」页。
-    in_custom: bool,
     /// 导入过的词库。
     imported: Vec<Imported>,
-    /// 窗口最高多高：屏幕扣掉菜单栏和 Dock。内容比这高时，标题栏和底部不动，中间那部分滚动。
-    max_height: Pixels,
     /// 正在导入，先不让再点。
     importing: bool,
+    ai_file: AiFile,
+    ai_services: AiServices,
+    /// 「AI」页的输入框里正显示着哪一家的设置。
+    ai_shown: Option<AiProvider>,
+    /// 模型、接口地址、Key 三个输入框，顺序同 `AiField::ALL`。
+    ai_fields: [Entity<TextField>; 3],
+    /// 正展开着的下拉框。
+    menu: Option<Menu>,
+    /// 模型选了「其他…」，自己填模型名。
+    other_model: bool,
+    /// 「检查一下」的进度和结果。
+    ai_check: Option<Check>,
+    /// 点了几次「检查一下」，给每一次编号。
+    checks: u64,
     focus: FocusHandle,
-    _subscriptions: [Subscription; 2],
+    _subscriptions: Vec<Subscription>,
 }
 
 impl SettingsView {
-    /// `dicts`：和设置文件放在一起的本地词库目录，打开窗口时数过一遍词数的话就接着用。
     /// `default_font`：设置里没指定字体时用的平台默认中文字体，界面文字也用它。
     /// `dict_dir`：安装包里的词库目录，自定义词库页用它给没写拼音的词定读音。
-    /// `max_height`：窗口最高多高，见 `size_for`。
     pub fn new(
         file: SettingsFile,
-        dicts: LocalDicts,
         default_font: impl Into<SharedString>,
         dict_dir: Option<PathBuf>,
-        max_height: Pixels,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let default_font = default_font.into();
+        let dicts = LocalDicts::beside(file.path());
         // 只查这几个字体，不把系统字体全列一遍：没装的字体会落到后备字体上，名字就对不上
         let text = cx.text_system();
         let fonts = FONTS
@@ -137,19 +208,30 @@ impl SettingsView {
         let engine =
             Engine::new(Dictionary::from_rime_sources(&[PREVIEW_DICT])).with_emoji(Emoji::parse(PREVIEW_EMOJI));
         let preview = cx.new(|_| CandidateView::new(default_font.clone(), |_| {}));
-        let subscriptions = [
+        let ai_fields = AiField::ALL.map(|field| {
+            cx.new(|cx| {
+                let mut text = TextField::new("", cx);
+                text.secret = field == AiField::Key;
+                text
+            })
+        });
+        let mut subscriptions = vec![
             // 回到这个窗口时重读一次：可能刚在编辑器里改过设置文件
             cx.observe_window_activation(window, |view, window, cx| {
                 if window.is_window_active() {
-                    view.reload(window, cx);
+                    view.reload(cx);
                 }
             }),
             cx.observe_window_appearance(window, |_, _, cx| cx.notify()),
         ];
+        for (field, entity) in AiField::ALL.into_iter().zip(&ai_fields) {
+            subscriptions.push(cx.subscribe(entity, move |view, _, _: &Edited, cx| view.ai_edited(field, cx)));
+        }
         // 拿着焦点，⌘W、⌘Q 这些快捷键才有地方派
         let focus = cx.focus_handle();
         focus.focus(window);
         let mut view = SettingsView {
+            ai_file: AiFile::beside(file.path()),
             file,
             dicts,
             settings: Settings::default(),
@@ -159,36 +241,36 @@ impl SettingsView {
             engine: Arc::new(engine),
             marked: String::new(),
             preview,
+            page: Page::Input,
             learned_words: 0,
             confirm: None,
-            custom_words: 0,
             dict_dir,
             custom: None,
-            in_custom: false,
             imported: Vec::new(),
-            max_height,
             importing: false,
+            ai_services: AiServices::default(),
+            ai_shown: None,
+            ai_fields,
+            menu: None,
+            other_model: false,
+            ai_check: None,
+            checks: 0,
             focus,
             _subscriptions: subscriptions,
         };
-        view.reload(window, cx);
+        view.reload(cx);
         view
     }
 
-    /// 按这份设置和导入过几个词库，窗口内容该多大。预览跟着字号变高，窗口也跟着变；打开窗口前用它定大小。
-    /// 不超过 `max_height`（屏幕扣掉菜单栏和 Dock 的高度），放不下时中间那部分滚动。
-    pub fn size_for(settings: &Settings, imported: usize, max_height: Pixels) -> Size<Pixels> {
-        let mut rows = SECTION_ROWS;
-        rows[2] += imported.min(MAX_LISTED);
-        let sections: f32 = rows.iter().map(|&rows| HEADER + rows as f32 * ROW + CARD_BORDER).sum();
-        size(px(WIDTH), px(TITLEBAR + stage_height(settings) + sections + FOOTER).min(max_height))
+    /// 窗口的大小，固定不变。不超过 `max_height`（屏幕扣掉菜单栏和 Dock 的高度），放不下时右边那一页滚动。
+    pub fn window_size(max_height: Pixels) -> Size<Pixels> {
+        size(px(WIDTH), px(HEIGHT).min(max_height))
     }
 
-    /// 设置文件改过（或者还没读过）就重读。读不了时和输入法一样用默认设置，并显示原因。
+    /// 设置文件、ai.toml 改过（或者还没读过）就重读。读不了时和输入法一样用默认设置，并显示原因。
     /// 用户词库是输入法写的、本地词库可能刚在编辑器里改过，每次都重数一遍。
-    fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn reload(&mut self, cx: &mut Context<Self>) {
         self.learned_words = self.userdict().count();
-        self.custom_words = self.dicts.custom_words().len();
         self.imported = self.dicts.imported();
         if let Some(result) = self.file.reload() {
             (self.settings, self.error) = match result {
@@ -196,13 +278,22 @@ impl SettingsView {
                 Err(err) => (Settings::default(), Some(err)),
             };
         }
-        self.refresh(window, cx);
+        match self.ai_file.reload() {
+            Some(Ok(services)) => {
+                self.ai_services = services;
+                // 输入框照着重读的内容重填
+                self.ai_shown = None;
+            }
+            Some(Err(err)) => self.error = Some(err),
+            None => {}
+        }
+        self.refresh(cx);
     }
 
     /// 改一项设置并写进文件。写不进去就保持原样，显示原因。
-    fn change(&mut self, edit: &dyn Fn(&mut Settings), window: &mut Window, cx: &mut Context<Self>) {
+    fn change(&mut self, edit: &dyn Fn(&mut Settings), cx: &mut Context<Self>) {
         // 文件可能刚在别处改过，以文件里的为准再改
-        self.reload(window, cx);
+        self.reload(cx);
         self.confirm = None;
         let mut next = self.settings.clone();
         edit(&mut next);
@@ -217,11 +308,11 @@ impl SettingsView {
             }
             Err(err) => self.error = Some(err),
         }
-        self.refresh(window, cx);
+        self.refresh(cx);
     }
 
-    /// 预览用真的输入会话打一遍 nihao，和打字时看到的一样；窗口跟着预览变高变矮，顶边不动。
-    fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// 预览用真的输入会话打一遍 nihao，和打字时看到的一样。换了服务商的话，AI 的输入框换成那一家的。
+    fn refresh(&mut self, cx: &mut Context<Self>) {
         let mut session = Session::new(self.engine.clone());
         session.set_settings(self.settings.clone());
         for c in PREVIEW_INPUT.chars() {
@@ -232,16 +323,31 @@ impl SettingsView {
             self.preview.update(cx, |preview, _| preview.set(Content::Candidates(panel), appearance));
             self.marked = marked;
         }
-        window.resize(Self::size_for(&self.settings, self.imported.len(), self.max_height));
         // 正开着自定义词库页时重读：可能刚在编辑器里改过。没开着的话，点进去时会重读
         if let Some(custom) = &self.custom {
-            let (accent, showing) = (self.settings.appearance.highlight_color, self.in_custom);
+            let (accent, showing) = (self.settings.appearance.highlight_color, self.page == Page::Custom);
             custom.update(cx, |custom, cx| {
                 custom.accent = accent;
                 if showing {
                     custom.reload(cx);
                 }
             });
+        }
+        let provider = self.settings.ai.provider;
+        if self.ai_shown != Some(provider) {
+            self.show_ai_fields(provider, cx);
+        }
+        cx.notify();
+    }
+
+    /// 换一页。回到窗口里的焦点；自定义词库页把光标放进「词」的输入框。在别处改过的，回到窗口时就重读了，这里不再读。
+    fn open(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
+        self.page = page;
+        self.confirm = None;
+        if page == Page::Custom {
+            self.open_custom(window, cx);
+        } else {
+            self.focus.focus(window);
         }
         cx.notify();
     }
@@ -253,8 +359,7 @@ impl SettingsView {
         // 拼音不显示在输入框里、又还没选字时，输入框里只有光标
         let marked = (!self.marked.is_empty()).then(|| div().underline().child(self.marked.clone()));
         div()
-            .mx(px(MARGIN))
-            .h(px(stage_height(&self.settings)))
+            .flex_none()
             .p(px(STAGE_PAD))
             .flex()
             .flex_col()
@@ -320,15 +425,7 @@ impl SettingsView {
         }
     }
 
-    /// 「自定义词库」一行的右边：有几个词，「管理」点进去加词、删词。
-    fn custom_control(&self, p: &Palette, cx: &mut Context<Self>) -> Div {
-        let count = (self.custom_words > 0).then(|| note(p, format!("{} 个词", self.custom_words)));
-        let manage = link("manage-custom", "管理", p.theme.accent)
-            .on_click(cx.listener(|view, _: &ClickEvent, window, cx| view.open_custom(window, cx)));
-        div().flex().items_center().gap(px(12.0)).children(count).child(manage)
-    }
-
-    /// 换到「自定义词库」页，光标放进「词」的输入框。
+    /// 打开「自定义词库」页：第一次建好，之后重读，光标放进「词」的输入框。
     fn open_custom(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let custom = match &self.custom {
             Some(custom) => custom.clone(),
@@ -339,13 +436,6 @@ impl SettingsView {
                     self.settings.appearance.highlight_color,
                 );
                 let custom = cx.new(|cx| CustomWordsView::new(dicts, dict_dir, accent, cx));
-                cx.subscribe_in(&custom, window, |view, _, _: &Back, window, cx| {
-                    view.in_custom = false;
-                    // 回来时窗口拿回焦点，⌘W 才有地方派；词数跟着重数
-                    view.focus.focus(window);
-                    view.reload(window, cx);
-                })
-                .detach();
                 self.custom = Some(custom.clone());
                 custom
             }
@@ -354,20 +444,17 @@ impl SettingsView {
             custom.reload(cx);
             custom.focus(window, cx);
         });
-        self.in_custom = true;
-        cx.notify();
     }
 
-    /// 「外部词库」一行的右边：选几个文件，在后台转好存进本地词库。
+    /// 「外部词库」页「导入」一行的右边：选几个文件，在后台转好存进本地词库。
     fn import_control(&self, p: &Palette, cx: &mut Context<Self>) -> Stateful<Div> {
         if self.importing {
             return div().id("import").child(note(p, "正在导入…"));
         }
-        link("import", "导入…", p.theme.accent)
-            .on_click(cx.listener(|view, _: &ClickEvent, window, cx| view.import(window, cx)))
+        link("import", "导入…", p.theme.accent).on_click(cx.listener(|view, _: &ClickEvent, _, cx| view.import(cx)))
     }
 
-    fn import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn import(&mut self, cx: &mut Context<Self>) {
         let picked = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -375,7 +462,7 @@ impl SettingsView {
             prompt: Some("导入".into()),
         });
         let dicts = LocalDicts::beside(self.file.path());
-        cx.spawn_in(window, async move |view, cx| {
+        cx.spawn(async move |view, cx| {
             let Ok(Ok(Some(paths))) = picked.await else { return };
             let _ = view.update(cx, |view, cx| {
                 view.importing = true;
@@ -385,10 +472,10 @@ impl SettingsView {
                 .background_executor()
                 .spawn(async move { paths.iter().map(|path| dicts.import(path)).collect::<Vec<_>>() })
                 .await;
-            let _ = view.update_in(cx, |view, window, cx| {
+            let _ = view.update(cx, |view, cx| {
                 view.importing = false;
                 view.error = results.into_iter().find_map(Result::err);
-                view.reload(window, cx);
+                view.reload(cx);
             });
         })
         .detach();
@@ -400,12 +487,12 @@ impl SettingsView {
         let confirming = self.confirm == Some(Confirm::Remove(name.clone()));
         let id = ElementId::Name(format!("remove-{name}").into());
         let remove = confirm_link(p, id, "删除".into(), "再点一次删除", confirming).on_click(cx.listener(
-            move |view, _: &ClickEvent, window, cx| {
+            move |view, _: &ClickEvent, _, cx| {
                 if view.confirmed(Confirm::Remove(name.clone())) {
                     if let Err(err) = view.dicts.remove(&name) {
                         view.error = Some(format!("删不了「{name}」：{err}"));
                     }
-                    view.reload(window, cx);
+                    view.reload(cx);
                 } else {
                     cx.notify();
                 }
@@ -414,14 +501,198 @@ impl SettingsView {
         div().flex().items_center().gap(px(12.0)).child(note(p, format!("{} 个词", dict.words))).child(remove)
     }
 
+    /// AI 的输入框换成这一家填过的内容。填过的模型不在这一家的选项里，就是选了「其他…」。
+    fn show_ai_fields(&mut self, provider: AiProvider, cx: &mut Context<Self>) {
+        let mut service = self.ai_services.get(provider).clone();
+        let preset = kyme_ai::preset(provider);
+        self.other_model = !service.model.is_empty() && !preset.models.contains(&service.model.as_str());
+        let placeholder = |field| match field {
+            AiField::Model => "模型名",
+            AiField::Endpoint => "http://localhost:11434/v1",
+            AiField::Key if preset.key_optional() => "可以不填",
+            AiField::Key => "",
+        };
+        for (field, entity) in AiField::ALL.into_iter().zip(&self.ai_fields) {
+            let text = std::mem::take(field.of(&mut service));
+            entity.update(cx, |entity, cx| {
+                entity.set_text(&text, cx);
+                entity.set_placeholder(placeholder(field), cx);
+            });
+        }
+        self.ai_shown = Some(provider);
+        self.menu = None;
+        self.ai_check = None;
+    }
+
+    /// 改了模型名、地址或 Key：记到正显示着的那一家，写进 ai.toml。
+    fn ai_edited(&mut self, field: AiField, cx: &mut Context<Self>) {
+        let provider = self.settings.ai.provider;
+        let text = self.ai_fields[field as usize].read(cx).text().to_string();
+        *field.of(self.ai_services.get_mut(provider)) = text;
+        self.save_ai(cx);
+    }
+
+    /// 各家的设置写进 ai.toml。填的变了，上次检查的结果不算数，还没回来的那次也作废。
+    fn save_ai(&mut self, cx: &mut Context<Self>) {
+        self.error = self.ai_file.save(&self.ai_services).err();
+        self.ai_check = None;
+        cx.notify();
+    }
+
+    /// 在下拉框里选了第 `index` 项。
+    fn pick_option(&mut self, menu: Menu, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.menu = None;
+        match menu {
+            Menu::Provider => {
+                let provider = AiProvider::ALL[index];
+                self.change(&move |s| s.ai.provider = provider, cx);
+            }
+            Menu::Model => self.pick_model(index, window, cx),
+        }
+        cx.notify();
+    }
+
+    /// 选了这一家的第 `index` 个模型；过了最后一个是「其他…」，光标放进下面填模型名的那一行。
+    fn pick_model(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let provider = self.settings.ai.provider;
+        let models = kyme_ai::preset(provider).models;
+        let field = &self.ai_fields[AiField::Model as usize];
+        match models.get(index) {
+            Some(model) => {
+                self.other_model = false;
+                field.update(cx, |field, cx| field.set_text(model, cx));
+                self.ai_services.get_mut(provider).model = model.to_string();
+            }
+            None => {
+                self.other_model = true;
+                // 原来选的是列出来的模型：清空，等着填
+                if models.contains(&self.ai_services.get(provider).model.as_str()) {
+                    field.update(cx, |field, cx| field.clear(cx));
+                    self.ai_services.get_mut(provider).model.clear();
+                }
+                field.read(cx).focus(window);
+            }
+        }
+        self.save_ai(cx);
+    }
+
+    /// 用定死的例子问一次正显示着的那一家，看填的能不能用。
+    fn check_ai(&mut self, cx: &mut Context<Self>) {
+        let provider = self.settings.ai.provider;
+        let service = self.ai_services.get(provider).clone();
+        self.checks += 1;
+        let id = self.checks;
+        self.ai_check = Some(Check::Running(id));
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let result = cx.background_executor().spawn(async move { check(provider, &service) }).await;
+            let _ = view.update(cx, |view, cx| {
+                // 这期间改了填的、换了服务商、又点了一次，这次的结果都不算数
+                if matches!(view.ai_check, Some(Check::Running(running)) if running == id) {
+                    view.ai_check = Some(Check::Done(result));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     fn page_picker(&self, p: &Palette, cx: &mut Context<Self>) -> Div {
         let current = self.settings.input.page_size;
         segmented(p).children(PAGE_SIZES.map(|n| {
             let selected = n == current;
-            segment(p, ("page", n), selected)
+            segment(p, ("page-size", n), selected)
                 .child(n.to_string())
                 .when(!selected, |segment| segment.on_click(on_change(cx, move |s| s.input.page_size = n)))
         }))
+    }
+
+    /// 下拉框：显示选中的那一项，点开是一列选项，打勾的是选中的。框的样子和输入框一样。
+    fn dropdown(&self, p: &Palette, menu: Menu, options: Vec<(SharedString, bool)>, cx: &mut Context<Self>) -> Div {
+        let open = self.menu == Some(menu);
+        let current =
+            options.iter().find(|(_, selected)| *selected).map(|(label, _)| label.clone()).unwrap_or_default();
+        let colors = field_colors(p);
+        let button = div()
+            .id(("dropdown", menu as usize))
+            .w(px(FIELD_WIDTH))
+            .h(px(FIELD_HEIGHT))
+            .px(px(10.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(if open { colors.accent } else { colors.border })
+            .bg(colors.background)
+            .text_size(px(13.0))
+            .cursor_pointer()
+            .child(div().min_w(px(0.0)).truncate().child(current))
+            .child(div().text_size(px(9.0)).text_color(p.theme.secondary).child("▼"))
+            .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
+                view.menu = Some(menu);
+                cx.notify();
+            }));
+        let list = open.then(|| {
+            let (hover, on_hover) = (p.theme.accent, p.theme.on_accent);
+            let items: Vec<Stateful<Div>> = options
+                .into_iter()
+                .enumerate()
+                .map(|(index, (label, selected))| {
+                    div()
+                        .id(("option", index))
+                        .h(px(26.0))
+                        .px(px(8.0))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .rounded(px(5.0))
+                        .text_size(px(13.0))
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(hover).text_color(on_hover))
+                        .child(label)
+                        .when(selected, |item| item.child("✓"))
+                        .on_click(cx.listener(move |view, _: &ClickEvent, window, cx| {
+                            view.pick_option(menu, index, window, cx)
+                        }))
+                })
+                .collect();
+            // 画在最上面，紧贴着下拉框的底边展开（浮层的起点就是下拉框的底边），碰到窗口边就往里收
+            deferred(
+                anchored().offset(point(px(0.0), px(DROPDOWN_GAP))).snap_to_window_with_margin(px(8.0)).child(
+                    div()
+                        .id(("menu", menu as usize))
+                        .occlude()
+                        .w(px(FIELD_WIDTH))
+                        .max_h(px(300.0))
+                        .overflow_y_scroll()
+                        .p(px(4.0))
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(p.line)
+                        .bg(p.card)
+                        .shadow(shadow(p.shadow, 4.0, 16.0))
+                        .children(items),
+                ),
+            )
+            .with_priority(2)
+        });
+        div().flex_none().child(button).children(list)
+    }
+
+    /// 下拉框展开时盖住整个窗口的一层：点别处就收起来，点到的东西不受影响。
+    fn backdrop(&self, window: &Window, cx: &mut Context<Self>) -> Deferred {
+        let viewport = window.viewport_size();
+        deferred(anchored().position(point(px(0.0), px(0.0))).child(
+            div().id("backdrop").w(viewport.width).h(viewport.height).occlude().on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, _: &MouseDownEvent, _, cx| {
+                    view.menu = None;
+                    cx.notify();
+                }),
+            ),
+        ))
+        .with_priority(1)
     }
 
     fn stepper(&self, p: &Palette, cx: &mut Context<Self>) -> Div {
@@ -501,123 +772,215 @@ impl SettingsView {
         }))
     }
 
-    /// 底部：打开设置文件；右边是版本号，出错时换成错误说明。
-    fn footer(&self, p: &Palette) -> Div {
+    /// 左边的导航栏：几页设置，最下面是打开设置文件和版本号。
+    fn sidebar(&self, p: &Palette, cx: &mut Context<Self>) -> Div {
+        let items: Vec<Stateful<Div>> = Page::ALL
+            .into_iter()
+            .map(|page| {
+                let hover = p.hover;
+                div()
+                    .id(("nav", page as usize))
+                    .h(px(28.0))
+                    .px(px(10.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(6.0))
+                    .text_size(px(13.0))
+                    .map(|item| {
+                        if page == self.page {
+                            item.bg(p.theme.accent).text_color(p.theme.on_accent)
+                        } else {
+                            item.cursor_pointer().hover(move |style| style.bg(hover)).on_click(
+                                cx.listener(move |view, _: &ClickEvent, window, cx| view.open(page, window, cx)),
+                            )
+                        }
+                    })
+                    .child(page.title())
+            })
+            .collect();
         let path = self.file.path().to_path_buf();
-        let note = match &self.error {
-            Some(err) => div().text_color(p.error).child(err.clone()),
-            None => div().text_color(p.theme.secondary).child(concat!("Kyme ", env!("CARGO_PKG_VERSION"))),
-        };
         div()
-            .h(px(FOOTER))
-            .mx(px(MARGIN))
+            .w(px(SIDEBAR))
+            .flex_none()
+            .h_full()
+            .pt(px(TITLEBAR + 12.0))
+            .px(px(10.0))
+            .pb(px(16.0))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .bg(p.sidebar)
+            .border_r_1()
+            .border_color(p.line)
+            .children(items)
+            .child(div().flex_1())
+            .child(
+                div()
+                    .px(px(10.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        link("open-file", "打开设置文件", p.theme.accent)
+                            .on_click(move |_, _, cx| open_text(path.clone(), cx)),
+                    )
+                    .child(note(p, concat!("Kyme ", env!("CARGO_PKG_VERSION")))),
+            )
+    }
+
+    /// 右边一页的标题，出错时下面一行红字说明。
+    fn header(&self, p: &Palette) -> Div {
+        div()
+            .flex_none()
+            .px(px(MARGIN))
+            .pt(px(16.0))
+            .pb(px(12.0))
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .child(div().text_size(px(17.0)).font_weight(FontWeight::SEMIBOLD).child(self.page.title()))
+            .children(self.error.clone().map(|err| note(p, err).text_color(p.error)))
+    }
+
+    fn input_page(&self, p: &Palette, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let input = &self.settings.input;
+        let rows = [
+            row(p, true, "每页候选", self.page_picker(p, cx)),
+            row(
+                p,
+                false,
+                "拼音显示在输入框里",
+                switch(p, "inline", input.inline_pinyin)
+                    .on_click(on_change(cx, |s| s.input.inline_pinyin = !s.input.inline_pinyin)),
+            ),
+            row(
+                p,
+                false,
+                "候选带 emoji",
+                switch(p, "emoji", input.emoji).on_click(on_change(cx, |s| s.input.emoji = !s.input.emoji)),
+            ),
+            row(p, false, "记住选过的词", self.learn_control(p, cx)),
+        ];
+        scrolling(Page::Input, [self.stage(p, window, cx), card(p).children(rows)])
+    }
+
+    fn appearance_page(&self, p: &Palette, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let rows = [
+            row(p, true, "字号", self.stepper(p, cx)),
+            row(p, false, "字体", self.font_picker(p, cx)),
+            row(p, false, "高亮色", self.color_picker(cx)),
+        ];
+        scrolling(Page::Appearance, [self.stage(p, window, cx), card(p).children(rows)])
+    }
+
+    fn imported_page(&self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let import = card(p).child(row(
+            p,
+            true,
+            described(p, "导入词库", ".scel、.dict.yaml、文本词表"),
+            self.import_control(p, cx),
+        ));
+        let listed: Vec<Div> = self
+            .imported
+            .iter()
+            .enumerate()
+            .map(|(i, dict)| row(p, i == 0, dict.name.clone(), self.remove_control(dict, p, cx)))
+            .collect();
+        let list =
+            if listed.is_empty() { note(p, "还没有导入过词库").px(px(4.0)) } else { card(p).children(listed) };
+        scrolling(Page::Imported, [import, list])
+    }
+
+    fn ai_page(&self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let ai = &self.settings.ai;
+        let toggle = card(p).child(row(
+            p,
+            true,
+            "AI 预测选词",
+            switch(p, "ai", ai.enabled).on_click(on_change(cx, |s| s.ai.enabled = !s.ai.enabled)),
+        ));
+        let provider = ai.provider;
+        let providers = AiProvider::ALL.map(|option| (option.name().into(), option == provider)).to_vec();
+        let field = |field: AiField| div().w(px(FIELD_WIDTH)).child(self.ai_fields[field as usize].clone());
+        let mut rows = vec![row(p, true, "服务商", self.dropdown(p, Menu::Provider, providers, cx))];
+        let preset = kyme_ai::preset(provider);
+        match preset.endpoint {
+            // 列出来的这几家：地址定死，模型从下拉框里选
+            Some(endpoint) => {
+                let model = preset.model(&self.ai_services.get(provider).model).unwrap_or_default();
+                let mut options: Vec<(SharedString, bool)> = preset
+                    .models
+                    .iter()
+                    .map(|option| (SharedString::from(*option), !self.other_model && *option == model))
+                    .collect();
+                options.push((OTHER_MODEL.into(), self.other_model));
+                rows.push(row(p, false, "接口地址", note(p, endpoint)));
+                rows.push(row(p, false, "模型", self.dropdown(p, Menu::Model, options, cx)));
+                if self.other_model {
+                    rows.push(row(p, false, "模型名", field(AiField::Model)));
+                }
+            }
+            // 自定义：地址和模型都自己填
+            None => {
+                rows.push(row(p, false, "接口地址", field(AiField::Endpoint)));
+                rows.push(row(p, false, "模型", field(AiField::Model)));
+            }
+        }
+        rows.push(row(p, false, "API Key", field(AiField::Key)));
+        let result = self.ai_check.as_ref().map(|check| match check {
+            Check::Running(_) => note(p, "检查中…"),
+            Check::Done(Ok(())) => note(p, "✓ 通过").text_color(p.success),
+            Check::Done(Err(err)) => note(p, err.clone()).text_color(p.error),
+        });
+        let check = div()
             .px(px(4.0))
             .flex()
-            .items_center()
-            .justify_between()
-            .gap(px(16.0))
-            .text_size(px(12.0))
+            .flex_col()
+            .gap(px(4.0))
             .child(
-                link("open-file", "打开设置文件", p.theme.accent)
-                    .flex_none()
-                    .on_click(move |_, _, cx| open_text(path.clone(), cx)),
+                link("check-ai", "检查一下", p.theme.accent)
+                    .on_click(cx.listener(|view, _: &ClickEvent, _, cx| view.check_ai(cx))),
             )
-            .child(note.min_w(px(0.0)).truncate())
+            .children(result);
+        scrolling(Page::Ai, [toggle, card(p).children(rows), check])
     }
 }
 
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::new(window.appearance(), self.settings.appearance.highlight_color);
-        if self.in_custom
-            && let Some(custom) = &self.custom
-        {
-            return self.frame(&p, "自定义词库").child(custom.clone());
+        let colors = field_colors(&p);
+        for field in &self.ai_fields {
+            field.update(cx, |field, _| field.colors = colors);
         }
-        let input = &self.settings.input;
-        let input_rows: [Div; SECTION_ROWS[0]] = [
-            row(&p, true, "每页候选", self.page_picker(&p, cx)),
-            row(
-                &p,
-                false,
-                "拼音显示在输入框里",
-                switch(&p, "inline", input.inline_pinyin)
-                    .on_click(on_change(cx, |s| s.input.inline_pinyin = !s.input.inline_pinyin)),
-            ),
-            row(
-                &p,
-                false,
-                "候选带 emoji",
-                switch(&p, "emoji", input.emoji).on_click(on_change(cx, |s| s.input.emoji = !s.input.emoji)),
-            ),
-            row(&p, false, "记住选过的词", self.learn_control(&p, cx)),
-        ];
-        let appearance_rows: [Div; SECTION_ROWS[1]] = [
-            row(&p, true, "字号", self.stepper(&p, cx)),
-            row(&p, false, "字体", self.font_picker(&p, cx)),
-            row(&p, false, "高亮色", self.color_picker(cx)),
-        ];
-        let dict_rows: [Div; SECTION_ROWS[2]] = [
-            row(&p, true, "自定义词库", self.custom_control(&p, cx)),
-            row(
-                &p,
-                false,
-                described(&p, "外部词库", "搜狗细胞词库 .scel、Rime .dict.yaml、文本词表"),
-                self.import_control(&p, cx),
-            ),
-        ];
-        let listed: Vec<Div> = self
-            .imported
-            .iter()
-            .map(|dict| row(&p, false, dict.name.clone(), self.remove_control(dict, &p, cx)))
-            .collect();
-        let listed = (!listed.is_empty())
-            .then(|| div().id("imported").max_h(px(MAX_LISTED as f32 * ROW)).overflow_y_scroll().children(listed));
-        let sections: [Div; SECTION_ROWS.len()] = [
-            section(&p, "输入", card(&p).children(input_rows)),
-            section(&p, "外观", card(&p).children(appearance_rows)),
-            section(&p, "词库", card(&p).children(dict_rows).children(listed)),
-        ];
-        // 屏幕不够高时，标题栏和底部不动，中间这部分滚动
-        let body = div()
-            .id("body")
-            .flex_1()
-            .min_h(px(0.0))
-            .overflow_y_scroll()
-            .child(div().flex().flex_col().child(self.stage(&p, window, cx)).children(sections));
-        self.frame(&p, "Kyme 设置").child(body).child(self.footer(&p))
-    }
-}
-
-impl SettingsView {
-    /// 整个窗口：底色、字体，最上面是标题栏。下面接着放这一页的内容。
-    fn frame(&self, p: &Palette, title: &'static str) -> Div {
+        let page = match self.page {
+            Page::Input => self.input_page(&p, window, cx),
+            Page::Appearance => self.appearance_page(&p, window, cx),
+            Page::Custom => match &self.custom {
+                Some(custom) => div().flex_1().min_h(px(0.0)).child(custom.clone()).into_any_element(),
+                None => div().into_any_element(),
+            },
+            Page::Imported => self.imported_page(&p, cx),
+            Page::Ai => self.ai_page(&p, cx),
+        };
+        let backdrop = self.menu.is_some().then(|| self.backdrop(window, cx));
         div()
             .track_focus(&self.focus)
             .size_full()
             .flex()
-            .flex_col()
             .bg(p.window)
             .font_family(self.default_font.clone())
             .text_color(p.theme.primary)
-            .child(
-                div()
-                    .h(px(TITLEBAR))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(13.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(title),
-            )
+            .child(self.sidebar(&p, cx))
+            .child(div().flex_1().min_w(px(0.0)).h_full().flex().flex_col().child(self.header(&p)).child(page))
+            .children(backdrop)
     }
 }
 
-/// 预览区的高度：模拟的输入框，加上和设置里一样大的候选窗。
-fn stage_height(settings: &Settings) -> f32 {
-    let m = Metrics::new(settings.appearance.font_size);
-    STAGE_PAD * 2.0 + INPUT_LINE + STAGE_GAP + panel_height(&m, !settings.input.inline_pinyin)
+/// 问一次这一家，看填的能不能用。只看请求通不通，不管它挑了哪句。
+fn check(provider: AiProvider, service: &AiService) -> Result<(), String> {
+    let client = kyme_ai::Client::new(provider, service)?;
+    client.pick(CHECK_CONTEXT, CHECK_PINYIN, &CHECK_CANDIDATES).map(|_| ()).map_err(|err| err.to_string())
 }
 
 /// 点一下改一项设置。
@@ -625,28 +988,18 @@ fn on_change(
     cx: &mut Context<SettingsView>,
     edit: impl Fn(&mut Settings) + 'static,
 ) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
-    cx.listener(move |view, _: &ClickEvent, window, cx| view.change(&edit, window, cx))
+    cx.listener(move |view, _: &ClickEvent, _, cx| view.change(&edit, cx))
 }
 
-/// 一组设置：小标题，下面一张卡片。
-fn section(p: &Palette, title: &'static str, card: Div) -> Div {
+/// 右边的一页：从上往下排，放不下时滚动。每页各自记着滚到哪了。
+fn scrolling(page: Page, children: impl IntoIterator<Item = Div>) -> AnyElement {
     div()
-        .mx(px(MARGIN))
-        .flex()
-        .flex_col()
-        .child(
-            div()
-                .h(px(HEADER))
-                .flex()
-                .items_end()
-                .pb(px(6.0))
-                .pl(px(4.0))
-                .text_size(px(12.0))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(p.theme.secondary)
-                .child(title),
-        )
-        .child(card)
+        .id(("page", page as usize))
+        .flex_1()
+        .min_h(px(0.0))
+        .overflow_y_scroll()
+        .child(div().px(px(MARGIN)).pb(px(20.0)).flex().flex_col().gap(px(16.0)).children(children))
+        .into_any_element()
 }
 
 /// 放一组设置的卡片，一行一行往里加。
@@ -720,6 +1073,17 @@ fn open_text(path: PathBuf, cx: &App) {
     cx.open_with_system(&path);
 }
 
+/// 输入框的颜色，跟着窗口的深浅色和高亮色。
+fn field_colors(p: &Palette) -> FieldColors {
+    FieldColors {
+        text: p.theme.primary,
+        placeholder: p.theme.secondary,
+        accent: p.theme.accent,
+        background: p.card,
+        border: p.line,
+    }
+}
+
 /// 分段控件的底。
 fn segmented(p: &Palette) -> Div {
     div().flex().items_center().gap(px(2.0)).p(px(2.0)).rounded(px(7.0)).bg(p.track)
@@ -769,6 +1133,8 @@ fn shadow(color: Hsla, y: f32, blur: f32) -> Vec<BoxShadow> {
 struct Palette {
     theme: Theme,
     window: Hsla,
+    /// 左边导航栏的底。
+    sidebar: Hsla,
     /// 预览区的底，比窗口暗一点，像一块桌面。
     stage: Hsla,
     card: Hsla,
@@ -781,6 +1147,7 @@ struct Palette {
     hover: Hsla,
     switch_off: Hsla,
     shadow: Hsla,
+    success: Hsla,
     error: Hsla,
 }
 
@@ -791,6 +1158,7 @@ impl Palette {
             WindowAppearance::Dark | WindowAppearance::VibrantDark => Palette {
                 theme,
                 window: rgb(0x1e1e1e).into(),
+                sidebar: rgb(0x262628).into(),
                 stage: rgb(0x111111).into(),
                 card: rgb(0x2a2a2c).into(),
                 line: rgba(0xffffff14).into(),
@@ -799,11 +1167,13 @@ impl Palette {
                 hover: rgba(0xffffff0f).into(),
                 switch_off: rgba(0x78788052).into(),
                 shadow: rgba(0x00000066).into(),
+                success: rgb(0x30d158).into(),
                 error: rgb(0xff453a).into(),
             },
             WindowAppearance::Light | WindowAppearance::VibrantLight => Palette {
                 theme,
                 window: rgb(0xf5f5f7).into(),
+                sidebar: rgb(0xebebef).into(),
                 stage: rgb(0xe8e8ed).into(),
                 card: rgb(0xffffff).into(),
                 line: rgba(0x00000014).into(),
@@ -812,6 +1182,7 @@ impl Palette {
                 hover: rgba(0x0000000a).into(),
                 switch_off: rgba(0x78788033).into(),
                 shadow: rgba(0x00000026).into(),
+                success: rgb(0x28a745).into(),
                 error: rgb(0xff3b30).into(),
             },
         }

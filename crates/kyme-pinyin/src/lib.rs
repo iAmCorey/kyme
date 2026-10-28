@@ -8,6 +8,7 @@ mod dict;
 mod emoji;
 mod engine;
 pub mod local;
+mod pairs;
 mod syllable;
 mod user;
 

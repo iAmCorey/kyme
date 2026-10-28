@@ -52,9 +52,9 @@ define_class!(
             }
         }
 
+        /// 系统差不多每打一个键都来要一次菜单，不在这里写日志。
         #[unsafe(method_id(menu))]
         fn menu(&self) -> Option<Retained<NSMenu>> {
-            log::info!("打开输入法菜单，{}", power::secure_input());
             input_menu()
         }
 

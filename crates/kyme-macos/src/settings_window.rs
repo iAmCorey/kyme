@@ -15,7 +15,7 @@ use gpui::{
     App, AppContext, Application, AsyncApp, Bounds, KeyBinding, Menu, MenuItem, Pixels, TitlebarOptions, WindowBounds,
     WindowHandle, WindowOptions, actions, point, px,
 };
-use kyme_core::{LocalDicts, SettingsFile};
+use kyme_core::SettingsFile;
 use kyme_ui::SettingsView;
 use objc2::MainThreadMarker;
 use objc2_app_kit::NSScreen;
@@ -95,11 +95,7 @@ fn show_existing() -> bool {
 }
 
 fn open_window(cx: &mut App, path: PathBuf) -> Option<WindowHandle<SettingsView>> {
-    // 先读一遍设置和导入过几个词库，按它定窗口大小：预览的高度跟着字号变，每个词库一行
-    let settings = SettingsFile::new(path.clone()).reload().and_then(Result::ok).unwrap_or_default();
-    let mut dicts = LocalDicts::beside(&path);
-    let max_height = max_height();
-    let size = SettingsView::size_for(&settings, dicts.imported().len(), max_height);
+    let size = SettingsView::window_size(max_height());
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size, cx))),
         titlebar: Some(TitlebarOptions {
@@ -113,7 +109,7 @@ fn open_window(cx: &mut App, path: PathBuf) -> Option<WindowHandle<SettingsView>
     cx.open_window(options, |window, cx| {
         // 不在安装包里跑（target 下的可执行文件）时读不到词库，自定义词库页就只显示写的拼音
         let file = SettingsFile::new(path);
-        cx.new(|cx| SettingsView::new(file, dicts, DEFAULT_FONT, crate::bundled_dict_dir(), max_height, window, cx))
+        cx.new(|cx| SettingsView::new(file, DEFAULT_FONT, crate::bundled_dict_dir(), window, cx))
     })
     .inspect_err(|err| log::error!("打不开设置窗口：{err}"))
     .ok()

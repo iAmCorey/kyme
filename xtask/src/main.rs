@@ -1,7 +1,9 @@
-//! 开发用的命令行工具，目前只有一个命令：
+//! 开发用的命令行工具：
 //!
-//! `cargo xtask qa`：检查。平时按改动挑着跑，发版时跑全部。各项查什么、怎么加用例、发版流程见 docs/QA.md。
+//! - `cargo xtask qa`：检查。平时按改动挑着跑，发版时跑全部。各项查什么、怎么加用例、发版流程见 docs/QA.md。
+//! - `cargo xtask ai-eval`：实测 AI 预测选词，要联网、要 Key，不放进 qa（见 ai_eval.rs）。
 
+mod ai_eval;
 #[cfg(target_os = "macos")]
 mod bundle;
 mod changes;
@@ -28,6 +30,7 @@ use crate::report::{Outcome, Report, Status};
 
 const USAGE: &str = "\
 用法：cargo xtask qa [--all] [--manual] [--release] [--only 检查,...]
+      cargo xtask ai-eval [服务商]   实测 AI 预测选词：联网，用输入法的 AI 设置；后面写服务商（比如 deepseek）可以换一家
 
   不带参数   按改动挑检查：只跑和还没推送的改动有关的那几项
   --all      全部自动检查：格式、clippy、单元测试、评测、按键场景、安装包、macOS 接入层。不动输入法设置，也不占屏幕
@@ -41,6 +44,16 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("qa") => qa(&args[1..]),
+        Some("ai-eval") => {
+            let root = repo_root();
+            match load_engine(&root) {
+                Ok(loaded) => ai_eval::run(&root, &loaded.engine, args.get(1).map(String::as_str)),
+                Err(err) => {
+                    eprintln!("{err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
@@ -173,6 +186,10 @@ impl Context {
     }
 }
 
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("xtask 在仓库根目录下").to_path_buf()
+}
+
 /// 先确保数据下载好，再和输入法一样用 `Engine::load_dir` 读 data/rime-ice/。安装包里放的也是这个目录。
 fn load_engine(root: &Path) -> Result<Loaded, String> {
     util::capture(Command::new(root.join("scripts/fetch-dict.sh")).current_dir(root))
@@ -192,7 +209,7 @@ fn qa(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("xtask 在仓库根目录下").to_path_buf();
+    let root = repo_root();
     let gates = match Gates::load(&root.join("qa/gates.toml")) {
         Ok(gates) => gates,
         Err(err) => {

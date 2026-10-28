@@ -10,9 +10,36 @@ use crate::userdict::today;
 
 /// 轻点 Shift 切换中英：按下到松开不能超过这么久，中间也不能按别的键。
 const SHIFT_TAP: Duration = Duration::from_millis(400);
+/// AI 挑的那句（✨）放上去以后这么久之内按的键、点的候选，都先把 ✨ 撤掉再处理：
+/// 刚要按空格时首选突然变了，空格选的还是你看到的那个。人看到变化再按键大约要这么久。
+const AI_GUARD: Duration = Duration::from_millis(300);
+/// 给 AI 挑的整句有几个。
+const AI_SENTENCES: usize = 8;
+/// 没挂用户词库、或者关了选词记忆时组整句用的空词库。
+static NO_USER_WORDS: UserDict = UserDict::empty();
 
 /// 选候选的键，按顺序对应本页第 1、2…… 个候选。每页最多也就这么多个候选。
 pub const SELECT_KEYS: &str = "1234567890";
+
+/// 要问 AI 的东西：哪一次的输入，已经选定的字，接着打的拼音，和给模型挑的几个整句（最好的在前）。
+/// 光标前的文字由平台层去读：会话不碰网络，也不碰 App 的输入框。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AiQuery {
+    /// 交回 `offer_ai` 时对一下，输入变了就作废。
+    pub generation: u64,
+    /// 已经选定、还没上屏的字，接在光标前的文字后面一起当前文。
+    pub selected: String,
+    pub pinyin: String,
+    /// 给 AI 挑的整句，第一句是现在的首选。
+    pub sentences: Vec<Candidate>,
+}
+
+/// 放上去的 ✨，和放之前的候选：要撤掉时换回去。
+struct AiOffer {
+    since: Instant,
+    candidates: Vec<Candidate>,
+    emoji_at: Option<usize>,
+}
 
 /// 鼠标点了候选窗的哪里。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +97,8 @@ pub struct Panel {
     pub highlighted: usize,
     /// 这一页里 emoji 是第几个候选（从 0 数），没有就是 None。候选窗在它前面画一条分隔线。
     pub emoji: Option<usize>,
+    /// 这一页里 AI 挑的那句是第几个候选，候选窗在它前面画 ✨。
+    pub ai: Option<usize>,
     pub has_prev: bool,
     pub has_next: bool,
 }
@@ -125,6 +154,10 @@ pub struct Session {
     punct: Punctuation,
     after_digit: bool,
     shift_down_at: Option<Instant>,
+    /// 候选每变一次加一。AI 的回答回来时对一下，对不上就是输入已经变了。
+    generation: u64,
+    /// 候选里放着 AI 挑的那句。
+    ai: Option<AiOffer>,
 }
 
 impl Session {
@@ -143,6 +176,8 @@ impl Session {
             punct: Punctuation::default(),
             after_digit: false,
             shift_down_at: None,
+            generation: 0,
+            ai: None,
         }
     }
 
@@ -204,6 +239,7 @@ impl Session {
         if self.mode == Mode::English || mods.any() {
             return self.pass();
         }
+        self.retract_fresh_ai();
 
         let composing = self.is_composing();
         let after_digit = std::mem::replace(&mut self.after_digit, false);
@@ -290,6 +326,7 @@ impl Session {
         if !self.is_composing() {
             return self.pass();
         }
+        self.retract_fresh_ai();
         match pick {
             Pick::Candidate(slot) if slot < self.page_size() => self.select(self.page() * self.page_size() + slot),
             Pick::Candidate(_) => self.handled(None),
@@ -326,10 +363,69 @@ impl Session {
                 candidates,
                 highlighted: self.highlight - start,
                 emoji: self.emoji_at.filter(|at| (start..start + page_size).contains(at)).map(|at| at - start),
+                ai: (self.ai.is_some() && page == 0).then_some(0),
                 has_prev: page > 0,
                 has_next: start + page_size < total,
             },
         }
+    }
+
+    /// 候选每变一次加一，见 `AiQuery::generation`。
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// 现在要不要问 AI，问什么。只在第一页、高亮还在首选、首选是照着打的整句时问：翻过页、挪过高亮，说明正在挑，
+    /// 不该再动候选；首选用了纠错的话，给 AI 挑的整句（不纠错）就对不上了。
+    pub fn ai_query(&self) -> Option<AiQuery> {
+        if self.input.is_empty() || self.highlight != 0 || self.ai.is_some() {
+            return None;
+        }
+        let first = self.conversion.candidates.first()?;
+        let mut sentences = self.engine.sentences(&self.input, self.learned_words(), AI_SENTENCES);
+        // 首选放在第一个，AI 挑它就是不用换。首选不在里面（用了纠错）就不问
+        let at = sentences.iter().position(|sentence| sentence.text == first.text)?;
+        let first = sentences.remove(at);
+        sentences.insert(0, first);
+        if sentences.len() < 2 {
+            return None;
+        }
+        Some(AiQuery { generation: self.generation, selected: self.selected(), pinyin: self.input.clone(), sentences })
+    }
+
+    /// AI 在 `query` 的整句里挑了第 `pick` 句：放到第一个、标上 ✨，原来的首选排第二。输入变了（`query` 过时）、
+    /// 已经在挑别的候选、挑的就是首选，都不动。`now` 是放上去的时间，`AI_GUARD` 从它算起。返回候选变没变。
+    pub fn offer_ai(&mut self, query: &AiQuery, pick: usize, now: Instant) -> bool {
+        if query.generation != self.generation || self.highlight != 0 || self.ai.is_some() {
+            return false;
+        }
+        let Some(sentence) = query.sentences.get(pick) else { return false };
+        if self.conversion.candidates.first().is_none_or(|first| first.text == sentence.text) {
+            return false;
+        }
+        let before = AiOffer { since: now, candidates: self.conversion.candidates.clone(), emoji_at: self.emoji_at };
+        // emoji 要留在第一页最后一格：先拿掉，放好 ✨ 再按新的首选重新放
+        if let Some(at) = self.emoji_at.take() {
+            self.conversion.candidates.remove(at);
+        }
+        self.conversion.candidates.retain(|candidate| candidate.text != sentence.text);
+        self.conversion.candidates.insert(0, sentence.clone());
+        self.emoji_at = self.add_emoji();
+        self.ai = Some(before);
+        true
+    }
+
+    /// ✨ 刚放上去就按了键、点了候选：先换回放之前的候选，按的键作用于你看到的那一份。
+    fn retract_fresh_ai(&mut self) {
+        if let Some(offer) = self.ai.take_if(|offer| offer.since.elapsed() < AI_GUARD) {
+            self.conversion.candidates = offer.candidates;
+            self.emoji_at = offer.emoji_at;
+        }
+    }
+
+    /// 组句用的用户词库：挂了而且开着选词记忆才用。
+    fn learned_words(&self) -> &UserDict {
+        self.user.as_ref().filter(|_| self.settings.input.learn).unwrap_or(&NO_USER_WORDS)
     }
 
     /// 中英切换。输入到一半时把打出的拼音原样上屏。
@@ -444,17 +540,20 @@ impl Session {
     }
 
     fn refresh(&mut self) {
-        self.conversion = match &self.user {
-            Some(user) if self.settings.input.learn => self.engine.convert_with(&self.input, user),
-            _ => self.engine.convert(&self.input),
-        };
-        self.emoji_at = if self.settings.input.emoji { self.add_emoji() } else { None };
+        self.conversion = self.engine.convert_with(&self.input, self.learned_words());
+        self.emoji_at = self.add_emoji();
         self.highlight = 0;
+        self.generation += 1;
+        self.ai = None;
     }
 
     /// 第一页最后一格放一个 emoji，返回它在候选列表里的下标。取第一页里第一个和整串拼音对得上、又有 emoji 的词，
     /// 用它的第一个 emoji，选中时一样消耗整串拼音。只放这一个、只放在这一格，前面几格永远是字，数字键选字的位置不受影响。
+    /// 设置里关了 emoji 就不放。
     fn add_emoji(&mut self) -> Option<usize> {
+        if !self.settings.input.emoji {
+            return None;
+        }
         let slot = self.page_size() - 1;
         let whole = self.input.len();
         let emoji = self.engine.emoji();
@@ -473,6 +572,8 @@ impl Session {
         self.conversion = Conversion::default();
         self.emoji_at = None;
         self.highlight = 0;
+        self.generation += 1;
+        self.ai = None;
     }
 
     fn handled(&mut self, commit: Option<String>) -> Response {
@@ -581,6 +682,57 @@ mod tests {
         type_str(&mut s, "ni");
         assert!(!pick_text(&mut s, "泥").learned);
         assert!(s.user_words().is_empty());
+    }
+
+    /// AI 挑的那句在给它的整句里排第几。
+    fn pick(query: &AiQuery, text: &str) -> usize {
+        query.sentences.iter().position(|sentence| sentence.text == text).unwrap_or_else(|| panic!("{text} 不在整句里"))
+    }
+
+    /// haonanhe 引擎首选「好难和」，「好难喝」在后面：词库里只有单字，看不出搭配。
+    fn ai_session() -> Session {
+        let dict = "好\thao\t1000\n难\tnan\t900\n和\the\t1000\n喝\the\t500\n";
+        let engine = Engine::new(Dictionary::from_rime_sources(&[dict])).with_emoji(Emoji::parse("好难喝\t🤢\n"));
+        Session::new(Arc::new(engine))
+    }
+
+    #[test]
+    fn the_ai_pick_goes_first_and_the_old_first_second() {
+        let mut s = ai_session();
+        type_str(&mut s, "haonanhe");
+        let query = s.ai_query().expect("该问 AI");
+        assert_eq!(query.sentences[0].text, "好难和");
+        // 放上去一秒以后才按键，过了保护时间
+        assert!(s.offer_ai(&query, pick(&query, "好难喝"), Instant::now() - Duration::from_secs(1)));
+        let View::Composing { panel, .. } = s.view() else { panic!("还在输入") };
+        assert_eq!(panel.candidates[..2], ["好难喝", "好难和"]);
+        assert_eq!(panel.ai, Some(0));
+        assert_eq!(panel.emoji, Some(panel.candidates.len() - 1), "emoji 还在最后一格");
+        assert_eq!(panel.candidates.last().map(String::as_str), Some("🤢"), "按新的首选配 emoji");
+        assert_eq!(s.ai_query(), None, "放了 ✨ 就不再问");
+        assert_eq!(press(&mut s, Key::Space).commit.as_deref(), Some("好难喝"));
+    }
+
+    #[test]
+    fn a_key_right_after_the_ai_pick_acts_on_the_list_you_saw() {
+        let mut s = ai_session();
+        type_str(&mut s, "haonanhe");
+        let query = s.ai_query().unwrap();
+        assert!(s.offer_ai(&query, pick(&query, "好难喝"), Instant::now()));
+        assert_eq!(press(&mut s, Key::Space).commit.as_deref(), Some("好难和"), "✨ 刚出来就按空格，选原来的首选");
+    }
+
+    #[test]
+    fn stale_or_pointless_ai_answers_are_ignored() {
+        let mut s = ai_session();
+        type_str(&mut s, "haonanhe");
+        let query = s.ai_query().unwrap();
+        assert!(!s.offer_ai(&query, 0, Instant::now()), "挑的就是首选");
+        type_str(&mut s, "h");
+        assert!(!s.offer_ai(&query, pick(&query, "好难喝"), Instant::now()), "输入已经变了");
+        press(&mut s, Key::Backspace);
+        press(&mut s, Key::Right);
+        assert_eq!(s.ai_query(), None, "挪过高亮，正在挑，就不问了");
     }
 
     #[test]

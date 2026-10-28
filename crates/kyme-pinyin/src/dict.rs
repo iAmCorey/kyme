@@ -324,6 +324,10 @@ impl Dictionary {
         &self.syls[e.syl_off as usize..][..usize::from(e.syl_len)]
     }
 
+    pub(crate) fn weight(&self, entry: u32) -> u32 {
+        self.entries[entry as usize].weight
+    }
+
     /// 一元模型下的代价：-ln(词频 / 总词频)。
     pub fn cost(&self, entry: u32) -> f64 {
         self.cost_of_weight(f64::from(self.entries[entry as usize].weight))

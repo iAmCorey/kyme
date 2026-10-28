@@ -5,11 +5,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use core_graphics::event::KeyCode;
-use gpui::AsyncApp;
+use gpui::{AsyncApp, Task};
 use kyme_core::pinyin::Engine;
 use kyme_core::{
-    Key, LocalDicts, Mode, Modifiers, Pick, Response, Session, Settings, SettingsFile, UserDictFile, View,
-    read_sources, today,
+    AiFile, AiProvider, AiQuery, AiService, AiServices, Key, LocalDicts, Mode, Modifiers, Panel, Pick, Response,
+    Session, Settings, SettingsFile, UserDictFile, View, read_sources, today,
 };
 use kyme_ui::Content;
 use objc2::Message;
@@ -27,6 +27,13 @@ const HINT_DURATION: Duration = Duration::from_millis(1500);
 const SLOW_KEY: Duration = Duration::from_millis(100);
 /// 学到新词后停这么久再存盘，打字时不反复写文件。
 const SAVE_DELAY: Duration = Duration::from_secs(10);
+/// 打字停下来这么久才问 AI：一直在打的时候不问，免得白发请求。
+const AI_PAUSE: Duration = Duration::from_millis(200);
+/// AI 的把握度到这个数才换首选。评测里这个门槛下没有把对的改错过（cargo xtask ai-eval）；
+/// 实际打字时不少回答在 0.3–0.5 之间，门槛定在 0.5 会白白丢掉。
+const AI_CONFIDENCE: f64 = 0.3;
+/// 光标前最多读这么多字当前文。
+const CONTEXT_CHARS: usize = 64;
 /// 小键盘上的回车，core-graphics 没有这个常量。
 const KEYPAD_ENTER: u16 = 0x4c;
 /// 不显示内嵌拼音、又还没选定任何字时，输入框里放的占位符（全角空格）。
@@ -55,8 +62,22 @@ pub struct AppState {
     client: Option<Retained<AnyObject>>,
     /// 客户端输入框里当前的 marked text，没变就不重复同步。
     marked: String,
+    /// 最近一次按键时光标的位置。AI 的回答到了要重画候选窗时用它，不再去问 App。
+    caret: NSRect,
     /// 每次显示中英提示加一，过期的隐藏任务据此作废。
     hint_generation: u64,
+    /// AI 组句：设置里开着、ai.toml 里这一家的 Key 填好了才有。
+    ai: Option<Arc<kyme_ai::Client>>,
+    /// ai.toml：各家服务商的 Key、模型和接口地址。
+    ai_file: AiFile,
+    ai_services: AiServices,
+    /// 现在的 AI 是照着哪一家的哪份设置建的，没建成（比如还没填 Key）也记着：设置没变就不重建，
+    /// 不每次切输入框都试一遍。
+    ai_for: Option<(AiProvider, AiService)>,
+    /// 等着问 AI 的计时器。换上新的，旧的就取消了。
+    ai_timer: Option<Task<()>>,
+    /// 已经问过 AI 的那一次输入，同一次不重复问。
+    ai_asked: u64,
     timings: Timings,
 }
 
@@ -92,6 +113,7 @@ pub fn activate() {
         state.reload_settings();
         state.reload_user_words();
         state.reload_local_dicts();
+        state.load_ai();
     });
 }
 
@@ -128,6 +150,7 @@ impl AppState {
         user_data: bool,
     ) -> Self {
         let userdict = user_data.then(|| UserDictFile::beside(settings.path()));
+        let ai_file = AiFile::beside(settings.path());
         let dicts = user_data.then(|| LocalDicts::beside(settings.path()));
         let mut state = AppState {
             session: Session::new(engine),
@@ -140,7 +163,14 @@ impl AppState {
             dicts_generation: 0,
             client: None,
             marked: String::new(),
+            caret: NSRect::ZERO,
             hint_generation: 0,
+            ai: None,
+            ai_file,
+            ai_services: AiServices::default(),
+            ai_for: None,
+            ai_timer: None,
+            ai_asked: 0,
             timings: Timings::default(),
         };
         state.reload_settings();
@@ -150,6 +180,7 @@ impl AppState {
             state.reload_user_words();
         }
         state.reload_local_dicts();
+        state.load_ai();
         state
     }
 
@@ -227,12 +258,139 @@ impl AppState {
             }
         };
         log::info!(
-            "设置已载入：每页 {} 个候选，字号 {}，内嵌拼音{}",
+            "设置已载入：每页 {} 个候选，字号 {}，内嵌拼音{}，AI 组句{}",
             settings.input.page_size,
             settings.appearance.font_size,
-            if settings.input.inline_pinyin { "开" } else { "关" }
+            if settings.input.inline_pinyin { "开" } else { "关" },
+            if settings.ai.enabled { "开" } else { "关" }
         );
         self.session.set_settings(settings);
+    }
+
+    /// AI 组句开着的话，照设置和 ai.toml 在后台建好；选的那一家的设置改过（设置窗口里刚填了 Key）就重建。
+    fn load_ai(&mut self) {
+        match self.ai_file.reload() {
+            Some(Ok(services)) => self.ai_services = services,
+            Some(Err(err)) => log::warn!("{err}"),
+            None => {}
+        }
+        let ai = &self.session.settings().ai;
+        let wanted = ai.enabled.then(|| (ai.provider, self.ai_services.get(ai.provider).clone()));
+        if wanted == self.ai_for {
+            return;
+        }
+        self.ai = None;
+        self.ai_for = wanted.clone();
+        let Some((provider, service)) = wanted else { return };
+        let config = (provider, service.clone());
+        // 建 HTTP 客户端要读系统证书，放到后台
+        let building = self.app.background_executor().spawn(async move { kyme_ai::Client::new(provider, &service) });
+        self.when(building, move |state, built| {
+            // 这期间设置又变了的话，等那一次的
+            if state.ai_for.as_ref() != Some(&config) {
+                return;
+            }
+            match built {
+                Ok(client) => {
+                    log::info!("AI 组句准备好了：{}，{}", client.provider().name(), client.model());
+                    state.ai = Some(Arc::new(client));
+                }
+                Err(err) => log::info!("AI 组句开着，但{err}"),
+            }
+        });
+    }
+
+    /// 停下来 `AI_PAUSE` 还没再动，就问 AI。每打一个键换一个计时器，前一个就取消了。
+    fn schedule_ai(&mut self) {
+        if self.ai.is_none() {
+            return;
+        }
+        let generation = self.session.generation();
+        let pause = self.app.background_executor().timer(AI_PAUSE);
+        self.ai_timer = Some(self.app.foreground_executor().spawn(async move {
+            pause.await;
+            let Some((ai, client)) = with_state(None, |state| state.ai_request(generation)) else { return };
+            // 读光标前的文字是一次跨进程的同步调用，等 App 回话时 IMK 会把接着按的键送进来。
+            // 这时不能占着全局状态：占着的话那个键进不了输入法，只能原样交给 App（打 lingwai 上屏一个 l）
+            let before = client::text_before_cursor(&client, CONTEXT_CHARS);
+            with_state((), |state| state.ask_ai(ai, generation, before));
+        }));
+    }
+
+    /// 停顿到了、输入还是那一次的话，取出问 AI 要用的 AI 和输入框，记下这一次问过了。
+    fn ai_request(&mut self, generation: u64) -> Option<(Arc<kyme_ai::Client>, Retained<AnyObject>)> {
+        if self.session.generation() != generation || self.ai_asked == generation {
+            return None;
+        }
+        let request = (self.ai.clone()?, self.client.clone()?);
+        self.ai_asked = generation;
+        Some(request)
+    }
+
+    /// 读到了光标前的文字 `before`：输入还是那一次的话，在后台问 AI。
+    fn ask_ai(&mut self, ai: Arc<kyme_ai::Client>, generation: u64, before: Option<String>) {
+        // 读的时候又打了字，这一次就不问了
+        if self.session.generation() != generation {
+            return;
+        }
+        let Some(query) = self.session.ai_query() else { return };
+        // 前文是光标前的文字，加上这一段里已经选定的字。没有前文，AI 也挑不出比引擎更好的
+        let context = before.unwrap_or_default() + &query.selected;
+        if context.trim().is_empty() {
+            return;
+        }
+        let asking = self.app.background_executor().spawn(async move {
+            let sentences: Vec<&str> = query.sentences.iter().map(|sentence| sentence.text.as_str()).collect();
+            let answer = ai.pick(&context, &query.pinyin, &sentences);
+            (query, answer, ai)
+        });
+        self.when(asking, |state, (query, answer, ai)| state.take_ai_answer(&query, answer, &ai));
+    }
+
+    /// `asked` 回答了：把握度够、输入还没变，就把它挑的那句放到第一个、重画候选窗。日志只记耗时和结果，不记内容。
+    fn take_ai_answer(
+        &mut self,
+        query: &AiQuery,
+        answer: Result<(kyme_ai::Pick, Duration), kyme_ai::Error>,
+        asked: &Arc<kyme_ai::Client>,
+    ) {
+        match answer {
+            Ok((pick, elapsed)) => {
+                let outcome = if pick.index == 0 {
+                    "和首选一样"
+                } else if pick.confidence < AI_CONFIDENCE {
+                    "把握不够，没换"
+                } else if self.session.offer_ai(query, pick.index, Instant::now()) {
+                    self.redraw();
+                    "换了首选"
+                } else {
+                    "输入已经变了，没换"
+                };
+                log::info!("AI 组句 {elapsed:?}，挑了第 {} 句，把握 {:.2}，{outcome}", pick.index + 1, pick.confidence);
+            }
+            // Key 不对：停掉问的那个，等设置窗口里换了 Key 再重建。这期间已经换上新的了就不动新的
+            Err(kyme_ai::Error::Key) => {
+                log::warn!("AI 组句：API Key 不对");
+                if self.ai.as_ref().is_some_and(|ai| Arc::ptr_eq(ai, asked)) {
+                    self.ai = None;
+                }
+            }
+            Err(err) => log::warn!("AI 组句没成：{}", err.log_line()),
+        }
+    }
+
+    /// 候选变了、但不是因为按键（AI 的回答到了）：照现在的样子重画候选窗。光标位置用最近一次按键时的，
+    /// 不再去问 App：这不是 IMK 的回调，跨进程问的时候接着按的键会进不来（见 `schedule_ai`）。
+    fn redraw(&mut self) {
+        if let View::Composing { panel, .. } = self.session.view() {
+            self.show_candidates(panel);
+        }
+    }
+
+    /// 在最近一次问到的光标位置显示候选窗。
+    fn show_candidates(&mut self, panel: Panel) {
+        let appearance = &self.session.settings().appearance;
+        self.panel.show(&self.app, Content::Candidates(panel), appearance, self.caret);
     }
 
     fn handle_event(&mut self, event: &NSEvent, client: &AnyObject) -> bool {
@@ -272,7 +430,8 @@ impl AppState {
                     client::set_marked_text(client, "");
                     self.marked.clear();
                 }
-                if response.mode_changed.is_none() {
+                // 中英提示只在到时间、开始组字、切走输入框时收起，切到英文后接着打字不收：不然一打字它就没了
+                if response.mode_changed.is_none() && !self.panel.showing_hint() {
                     self.panel.hide();
                 }
             }
@@ -283,9 +442,9 @@ impl AppState {
                     self.marked = marked;
                 }
                 // 每个键都重新问：组字期间窗口可能被拖动、页面可能滚动，marked text 不变位置也会变
-                let caret = client::caret_rect(client);
-                let appearance = &self.session.settings().appearance;
-                self.panel.show(&self.app, Content::Candidates(panel), appearance, caret);
+                self.caret = client::caret_rect(client);
+                self.show_candidates(panel);
+                self.schedule_ai();
             }
         }
         if let Some(mode) = response.mode_changed {
@@ -304,7 +463,7 @@ impl AppState {
         let appearance = &self.session.settings().appearance;
         self.panel.show(&self.app, Content::Mode(mode), appearance, caret);
         self.after(HINT_DURATION, move |state| {
-            if state.hint_generation == generation && !state.session.is_composing() {
+            if state.hint_generation == generation && state.panel.showing_hint() {
                 state.panel.hide();
             }
         });
