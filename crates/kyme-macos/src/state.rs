@@ -7,7 +7,10 @@ use std::time::{Duration, Instant};
 use core_graphics::event::KeyCode;
 use gpui::AsyncApp;
 use kyme_core::pinyin::Engine;
-use kyme_core::{Key, Mode, Modifiers, Pick, Response, Session, Settings, SettingsFile, UserDictFile, View, today};
+use kyme_core::{
+    Key, LocalDicts, Mode, Modifiers, Pick, Response, Session, Settings, SettingsFile, UserDictFile, View,
+    read_sources, today,
+};
 use kyme_ui::Content;
 use objc2::Message;
 use objc2::rc::Retained;
@@ -44,6 +47,10 @@ pub struct AppState {
     userdict: Option<UserDictFile>,
     /// 学到了新词，还没存盘。从无到有时安排一次存盘，这段时间里再学到的一起存。
     unsaved: bool,
+    /// 本地词库的目录。自测模式不读。
+    dicts: Option<LocalDicts>,
+    /// 每次开始重建本地词库加一。建好时对不上，说明这期间又改过、又开始了一次，这次的作废。
+    dicts_generation: u64,
     /// 最近一次按键所在的输入框。鼠标点候选窗时往这里上屏。
     client: Option<Retained<AnyObject>>,
     /// 客户端输入框里当前的 marked text，没变就不重复同步。
@@ -79,11 +86,12 @@ pub fn handle_event(event: &NSEvent, client: &AnyObject) -> bool {
     with_state(false, |state| state.handle_event(event, client))
 }
 
-/// 每次切到一个输入框时调用。顺便检查设置文件和用户词库有没有改过。
+/// 每次切到一个输入框时调用。顺便检查设置文件、用户词库和本地词库有没有改过。
 pub fn activate() {
     with_state((), |state| {
         state.reload_settings();
         state.reload_user_words();
+        state.reload_local_dicts();
     });
 }
 
@@ -111,13 +119,16 @@ pub fn pick(pick: Pick) {
 }
 
 impl AppState {
+    /// `user_data`：读写用户词库和本地词库（和设置文件放在一起）。自测模式不读也不写。
     pub fn new(
         engine: Arc<Engine>,
         panel: PanelWindow,
         app: AsyncApp,
         settings: SettingsFile,
-        userdict: Option<UserDictFile>,
+        user_data: bool,
     ) -> Self {
+        let userdict = user_data.then(|| UserDictFile::beside(settings.path()));
+        let dicts = user_data.then(|| LocalDicts::beside(settings.path()));
         let mut state = AppState {
             session: Session::new(engine),
             panel,
@@ -125,6 +136,8 @@ impl AppState {
             settings,
             userdict,
             unsaved: false,
+            dicts,
+            dicts_generation: 0,
             client: None,
             marked: String::new(),
             hint_generation: 0,
@@ -136,6 +149,7 @@ impl AppState {
             state.session.set_user_words(Vec::new());
             state.reload_user_words();
         }
+        state.reload_local_dicts();
         state
     }
 
@@ -149,14 +163,40 @@ impl AppState {
         }
     }
 
+    /// 本地词库有改动就在后台重建，建好再换上，打字不用等。新引擎和现在的共用主词库，只换本地词库。
+    fn reload_local_dicts(&mut self) {
+        let Some(paths) = self.dicts.as_mut().and_then(LocalDicts::reload) else { return };
+        self.dicts_generation += 1;
+        let generation = self.dicts_generation;
+        let engine = self.session.engine().clone();
+        let building = self.app.background_executor().spawn(async move {
+            let started = Instant::now();
+            let sources = read_sources(&paths);
+            let engine = engine.with_local(&sources.iter().map(String::as_str).collect::<Vec<_>>());
+            (engine, started.elapsed())
+        });
+        self.when(building, move |state, (engine, elapsed)| {
+            // 这期间又改过、又开始建了的话，等那一次的
+            if state.dicts_generation == generation {
+                log::info!("本地词库载入：{} 个词，耗时 {elapsed:?}", engine.local().len());
+                state.session.set_engine(Arc::new(engine));
+                crate::release_memory();
+            }
+        });
+    }
+
     /// 过一会儿在主线程上对全局状态做 `f`。
     fn after(&self, delay: Duration, f: impl FnOnce(&mut AppState) + 'static) {
-        let timer = self.app.background_executor().timer(delay);
+        self.when(self.app.background_executor().timer(delay), move |state, _| f(state));
+    }
+
+    /// 等 `task` 完成后，在主线程上拿它的结果对全局状态做 `f`。
+    fn when<T: 'static>(&self, task: impl Future<Output = T> + 'static, f: impl FnOnce(&mut AppState, T) + 'static) {
         self.app
             .foreground_executor()
             .spawn(async move {
-                timer.await;
-                with_state((), f);
+                let output = task.await;
+                with_state((), |state| f(state, output));
             })
             .detach();
     }

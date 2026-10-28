@@ -119,7 +119,7 @@ pub fn run() {
     let settings = std::env::temp_dir().join(format!("kyme-qa-{}.toml", std::process::id()));
     let loading = crate::load_engine_in_background();
     Application::new().run(move |cx| {
-        crate::boot(cx, loading, SettingsFile::new(settings.clone()), None);
+        crate::boot(cx, loading, SettingsFile::new(settings.clone()), false);
         thread::spawn(move || serve(settings));
     });
 }

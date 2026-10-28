@@ -1,5 +1,6 @@
 //! GPUI 界面：候选窗和设置窗口。三个桌面端共用，平台层只决定窗口放在哪、什么时候显示。
 
+mod input;
 mod settings;
 
 use std::rc::Rc;
@@ -9,6 +10,7 @@ use gpui::{
     App, ClickEvent, Context, Div, Hsla, Pixels, Render, SharedString, Size, TextRun, Window, WindowAppearance, div,
     font, px, rgb, rgba, size,
 };
+pub use input::bind_keys as bind_text_field_keys;
 use kyme_core::{AppearanceSettings, Mode, Panel, Pick, Rgb, SELECT_KEYS};
 pub use settings::SettingsView;
 

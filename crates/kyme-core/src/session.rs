@@ -158,13 +158,22 @@ impl Session {
         self.settings = settings.normalized();
     }
 
-    pub fn engine(&self) -> &Engine {
+    pub fn engine(&self) -> &Arc<Engine> {
         &self.engine
+    }
+
+    /// 换一个引擎，比如本地词库改了、在后台重建好了。学到的词按新的词库重算代价。
+    /// 正在打的这段照旧，下一个键起用新的。
+    pub fn set_engine(&mut self, engine: Arc<Engine>) {
+        self.engine = engine;
+        if let Some(user) = self.user.take() {
+            self.set_user_words(user.into_words());
+        }
     }
 
     /// 挂上用户词库，比如刚从文件读出来的词。挂上以后才学词。
     pub fn set_user_words(&mut self, words: Vec<UserWord>) {
-        self.user = Some(UserDict::new(self.engine.dictionary(), words));
+        self.user = Some(UserDict::new(&self.engine, words));
     }
 
     /// 学到的词，存盘用。
@@ -387,9 +396,9 @@ impl Session {
         }
         let Some(user) = &mut self.user else { return };
         let day = today();
-        let dict = self.engine.dictionary();
+        let engine = &self.engine;
         for piece in self.pieces.iter().filter(|piece| piece.chosen) {
-            self.learned |= user.learn(dict, &piece.text, &piece.syllables, day);
+            self.learned |= user.learn(engine, &piece.text, &piece.syllables, day);
         }
         let phrase = self.pieces.len() >= 2
             && self.pieces.iter().any(|piece| piece.chosen)
@@ -397,7 +406,7 @@ impl Session {
         if phrase {
             let text: String = self.pieces.iter().map(|piece| piece.text.as_str()).collect();
             let syllables: Vec<SylId> = self.pieces.iter().flat_map(|piece| piece.syllables.iter().copied()).collect();
-            self.learned |= user.learn(dict, &text, &syllables, day);
+            self.learned |= user.learn(engine, &text, &syllables, day);
         }
     }
 

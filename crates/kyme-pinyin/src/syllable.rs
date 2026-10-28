@@ -40,7 +40,7 @@ impl SylSet {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct SyllableTable {
     names: Vec<String>,
     exact: HashMap<String, SylId>,
@@ -146,6 +146,11 @@ impl SyllableTable {
     /// 音节的首字母，简拼索引用它做 key。
     pub fn initial(&self, id: SylId) -> u8 {
         self.names[id as usize].as_bytes()[0]
+    }
+
+    /// 一串音节的拼写，用空格隔开，比如 `ni hao`。
+    pub fn spell(&self, ids: &[SylId]) -> String {
+        ids.iter().map(|&id| self.name(id)).collect::<Vec<_>>().join(" ")
     }
 
     pub fn max_len(&self) -> usize {

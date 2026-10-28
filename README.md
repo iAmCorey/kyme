@@ -11,6 +11,7 @@
 - 拼音显示在输入框里，候选窗一行，每页 5–10 个
 - 候选带 emoji（`haha` → 😄）
 - 记住选过的词：常选的往前排，只存在本机
+- 自定义词库；导入外部词库（搜狗细胞词库、Rime、文本）
 - Shift 切换中英
 - 中文标点，引号自动配对
 - 不联网，日志不记输入内容
@@ -46,7 +47,7 @@ scripts/dev-install.sh
 
 输入法菜单里选「Kyme 设置…」，或从 Spotlight、启动台打开 Kyme。
 
-也可以直接改 `~/Library/Application Support/Kyme/settings.toml`，保存后切换一下输入框生效。
+也可以直接改 `~/Library/Application Support/Kyme/settings.toml`，保存后切换一下输入框生效。自定义词库和导入的外部词库在同目录的 `dicts/` 里。
 
 ## 开发
 

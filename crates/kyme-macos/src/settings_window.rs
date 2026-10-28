@@ -12,11 +12,13 @@ use std::thread;
 
 use dispatch2::DispatchQueue;
 use gpui::{
-    App, AppContext, Application, AsyncApp, Bounds, KeyBinding, Menu, MenuItem, TitlebarOptions, WindowBounds,
+    App, AppContext, Application, AsyncApp, Bounds, KeyBinding, Menu, MenuItem, Pixels, TitlebarOptions, WindowBounds,
     WindowHandle, WindowOptions, actions, point, px,
 };
-use kyme_core::SettingsFile;
+use kyme_core::{LocalDicts, SettingsFile};
 use kyme_ui::SettingsView;
+use objc2::MainThreadMarker;
+use objc2_app_kit::NSScreen;
 
 use crate::panel::DEFAULT_FONT;
 
@@ -62,6 +64,7 @@ pub fn run(path: PathBuf) {
         cx.on_action(|_: &Quit, cx| cx.quit());
         // 只有一个窗口，关窗口就是退出
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None), KeyBinding::new("cmd-w", Quit, None)]);
+        kyme_ui::bind_text_field_keys(cx);
         cx.set_menus(vec![Menu { name: "Kyme".into(), items: vec![MenuItem::action("退出 Kyme 设置", Quit)] }]);
         let Some(handle) = open_window(cx, path) else {
             cx.quit();
@@ -92,10 +95,13 @@ fn show_existing() -> bool {
 }
 
 fn open_window(cx: &mut App, path: PathBuf) -> Option<WindowHandle<SettingsView>> {
-    // 先读一遍设置，按它定窗口大小：预览的高度跟着字号变
+    // 先读一遍设置和导入过几个词库，按它定窗口大小：预览的高度跟着字号变，每个词库一行
     let settings = SettingsFile::new(path.clone()).reload().and_then(Result::ok).unwrap_or_default();
+    let mut dicts = LocalDicts::beside(&path);
+    let max_height = max_height();
+    let size = SettingsView::size_for(&settings, dicts.imported().len(), max_height);
     let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, SettingsView::size_for(&settings), cx))),
+        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size, cx))),
         titlebar: Some(TitlebarOptions {
             title: Some("Kyme 设置".into()),
             appears_transparent: true,
@@ -105,10 +111,18 @@ fn open_window(cx: &mut App, path: PathBuf) -> Option<WindowHandle<SettingsView>
         ..Default::default()
     };
     cx.open_window(options, |window, cx| {
-        cx.new(|cx| SettingsView::new(SettingsFile::new(path), DEFAULT_FONT, window, cx))
+        // 不在安装包里跑（target 下的可执行文件）时读不到词库，自定义词库页就只显示写的拼音
+        let file = SettingsFile::new(path);
+        cx.new(|cx| SettingsView::new(file, dicts, DEFAULT_FONT, crate::bundled_dict_dir(), max_height, window, cx))
     })
     .inspect_err(|err| log::error!("打不开设置窗口：{err}"))
     .ok()
+}
+
+/// 设置窗口最高多高：主屏幕扣掉菜单栏和 Dock 的高度。窗口开在主屏幕中间。
+fn max_height() -> Pixels {
+    let mtm = MainThreadMarker::new().expect("设置窗口在主线程上开");
+    px(NSScreen::mainScreen(mtm).map_or(f32::MAX, |screen| screen.visibleFrame().size.height as f32))
 }
 
 /// 别的进程叫这个窗口到最前面。

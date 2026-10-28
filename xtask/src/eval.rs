@@ -3,7 +3,7 @@
 //! 每一条都从第一个字母打到最后一个，每一步输入框显示的（preedit）都要是打的字母，纠过错的也一样。
 //! 「本来就对」这一类是照着打的输入，还要求每一步引擎理解的拼音（spelling）也和打的字母一样，
 //! 也就是没被当成打错。同样的要求再放到最常用的音节两两拼接上（那按、下岸……），被改掉的比例不能超过门槛。
-//! 再带上一万个故意捣乱的用户词跑一遍：被改的不能变多，单条转换也不能慢过门槛。
+//! 再带上一万个故意捣乱的本地词和用户词跑一遍：被改的不能变多，单条转换也不能慢过门槛。
 //!
 //! eval/pending.tsv（可选，格式相同）放暂时还做不到的用例：只报告不卡发版，哪条做到了会提示挪过去。
 
@@ -82,7 +82,7 @@ fn evaluate(engine: &Engine, user: &UserDict, cases: &[Case]) -> Evaluation {
 
 /// 拿常用音节两两拼接的个数：80 个，6400 个输入。
 const COMMON_SYLLABLES: usize = 80;
-/// 故意捣乱的用户词库用前 100 个常用音节两两拼成，正好一万个词。
+/// 故意捣乱的本地词库和用户词库都用前 100 个常用音节两两拼成，各一万个词。
 const ADVERSARIAL_SYLLABLES: usize = 100;
 
 /// 从第一个字母打到最后一个，每一步从转换结果里取一份拼音，去掉分隔符后都要和已经打的字母一样。
@@ -145,21 +145,33 @@ fn altered_pairs(engine: &Engine, user: &UserDict) -> (usize, Vec<String>) {
     (common.len() * common.len(), altered)
 }
 
-/// 一万个故意捣乱的用户词：常用音节两两拼成，每个都选过很多次、加分到顶。
-/// 用户词只进照着打的读法，带上它们，打对的拼音只会更少被改；转换也不能因此慢过门槛。
+/// 前 100 个常用音节两两拼成的一万个读音。
+fn adversarial_pairs(engine: &Engine) -> Vec<[&str; 2]> {
+    let common = common_syllables(engine, ADVERSARIAL_SYLLABLES);
+    common.iter().flat_map(|first| common.iter().map(move |second| [*first, *second])).take(MAX_WORDS).collect()
+}
+
+/// 带一万个故意捣乱的本地词的引擎：每个读音一个词，词频高得离谱。
+/// 本地词只进照着打的读法，带上它们，打对的拼音只会更少被改；转换也不能因此慢过门槛。
+fn adversarial_local(engine: &Engine) -> Engine {
+    let source: String = adversarial_pairs(engine)
+        .into_iter()
+        .map(|[first, second]| format!("搅局\t{first} {second}\t100000000\n"))
+        .collect();
+    engine.with_local(&[&source])
+}
+
+/// 一万个故意捣乱的用户词：每个读音一个词，都选过很多次、加分到顶。道理同上。
 fn adversarial_user(engine: &Engine) -> UserDict {
     let table = engine.dictionary().table();
-    let common = common_syllables(engine, ADVERSARIAL_SYLLABLES);
-    let words = common
-        .iter()
-        .flat_map(|first| common.iter().map(move |second| [*first, *second]))
-        .take(MAX_WORDS)
+    let words = adversarial_pairs(engine)
+        .into_iter()
         .filter_map(|pair| {
             let syllables = pair.iter().map(|name| table.exact(name)).collect::<Option<Vec<_>>>()?;
             Some(UserWord { text: "捣乱".into(), syllables, count: 1000.0, day: 0 })
         })
         .collect();
-    UserDict::new(engine.dictionary(), words)
+    UserDict::new(engine, words)
 }
 
 pub fn run(ctx: &mut Context) -> Outcome {
@@ -176,17 +188,18 @@ pub fn run(ctx: &mut Context) -> Outcome {
     let gates = &ctx.gates.engine;
 
     let misshown: Vec<String> = cases.iter().filter_map(|case| first_misshown(&loaded.engine, &case.input)).collect();
-    let user = adversarial_user(&loaded.engine);
+    let crowded = adversarial_local(&loaded.engine);
+    let user = adversarial_user(&crowded);
     let altered = altered_prefixes(&loaded.engine, &no_user, &cases);
-    let altered_with_user = altered_prefixes(&loaded.engine, &user, &cases).len();
-    // 带不带用户词的两轮常用拼接各打 6400 个输入，放在两个线程里同时跑
+    let altered_with_user = altered_prefixes(&crowded, &user, &cases).len();
+    // 带不带捣乱的词的两轮常用拼接各打 6400 个输入，放在两个线程里同时跑
     let ((pairs, altered_pairs), (_, pairs_with_user)) = std::thread::scope(|scope| {
-        let with_user = scope.spawn(|| altered_pairs(&loaded.engine, &user));
+        let with_user = scope.spawn(|| altered_pairs(&crowded, &user));
         let without = altered_pairs(&loaded.engine, &no_user);
-        (without, with_user.join().expect("带用户词的那一轮崩了"))
+        (without, with_user.join().expect("带捣乱的词的那一轮崩了"))
     });
     let altered_percent = 100.0 * altered_pairs.len() as f64 / pairs.max(1) as f64;
-    let slowest_with_user = evaluate(&loaded.engine, &user, &cases).slowest;
+    let slowest_with_user = evaluate(&crowded, &user, &cases).slowest;
     let mut problems = Vec::new();
     if !result.misses.is_empty() {
         problems.push(format!("{} 条没打对", result.misses.len()));
@@ -204,11 +217,11 @@ pub fn run(ctx: &mut Context) -> Outcome {
         ));
     }
     if altered_with_user > altered.len() || pairs_with_user.len() > altered_pairs.len() {
-        problems.push("带上用户词库后，打对的拼音被改得更多了".into());
+        problems.push("带上本地词库和用户词库后，打对的拼音被改得更多了".into());
     }
     if util::as_ms(slowest_with_user) > gates.max_convert_ms {
         problems.push(format!(
-            "带一万个用户词时单条最慢 {}，超过门槛 {}ms",
+            "带一万个本地词和用户词时单条最慢 {}，超过门槛 {}ms",
             util::millis(slowest_with_user),
             gates.max_convert_ms
         ));
@@ -247,7 +260,7 @@ pub fn run(ctx: &mut Context) -> Outcome {
         gates.max_altered_percent
     ));
     details.push(format!(
-        "带一万个捣乱的用户词：常用拼接被改 {} 个，照着打的输入被改 {} 条，单条最慢 {}",
+        "带一万个捣乱的本地词和用户词：常用拼接被改 {} 个，照着打的输入被改 {} 条，单条最慢 {}",
         pairs_with_user.len(),
         altered_with_user,
         util::millis(slowest_with_user)

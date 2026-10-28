@@ -1,17 +1,24 @@
-//! 设置窗口：上面是候选窗的预览，下面是分成「输入」「外观」两组的各项。点一下就写进设置文件，
-//! 文件里的注释照旧；输入法切换输入框时读到新设置。
+//! 设置窗口：上面是候选窗的预览，下面是分成「输入」「外观」「词库」三组的各项。点一下就写进设置文件，
+//! 文件里的注释照旧；输入法切换输入框时读到新设置。「自定义词库」点进去是单独的一页（custom.rs）。
 
+mod custom;
+
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
-    App, BoxShadow, ClickEvent, Context, Div, ElementId, Entity, FocusHandle, FontWeight, Hsla, Pixels, Render,
-    SharedString, Size, Stateful, Subscription, Window, WindowAppearance, div, font, point, px, rgb, rgba, size,
-    transparent_black,
+    App, BoxShadow, ClickEvent, Context, Div, ElementId, Entity, FocusHandle, FontWeight, Hsla, PathPromptOptions,
+    Pixels, Render, SharedString, Size, Stateful, Subscription, Window, WindowAppearance, div, font, point, px, rgb,
+    rgba, size, transparent_black,
 };
 use kyme_core::pinyin::{Dictionary, Emoji, Engine};
-use kyme_core::{FONT_SIZES, Key, Modifiers, PAGE_SIZES, Rgb, Session, Settings, SettingsFile, UserDictFile, View};
+use kyme_core::{
+    FONT_SIZES, Imported, Key, LocalDicts, Modifiers, PAGE_SIZES, Rgb, Session, Settings, SettingsFile, UserDictFile,
+    View,
+};
 
+use self::custom::{Back, CustomWordsView};
 use crate::{CandidateView, Content, Metrics, Theme, panel_height};
 
 const WIDTH: f32 = 520.0;
@@ -28,8 +35,10 @@ const STAGE_GAP: f32 = 8.0;
 /// 分组的标题，连同上方的留白。
 const HEADER: f32 = 32.0;
 const ROW: f32 = 40.0;
-/// 每组几项。render 里每组的行按它定长，加了一组或一项忘了改这里会编译不过，窗口高度就不会算错。
-const SECTION_ROWS: [usize; 2] = [4, 3];
+/// 「输入」「外观」「词库」每组固定几项。render 里每组的行按它定长，加了一组或一项忘了改这里会编译不过，
+/// 窗口高度就不会算错。「词库」组下面每个导入过的外部词库再一行，多于 MAX_LISTED 个就在卡片里滚动。
+const SECTION_ROWS: [usize; 3] = [4, 3, 2];
+const MAX_LISTED: usize = 4;
 /// 每组卡片上下各一像素的边框。
 const CARD_BORDER: f32 = 2.0;
 const FOOTER: f32 = 48.0;
@@ -53,8 +62,19 @@ const FONTS: [(&str, &str); 6] = [
 /// 高亮色的选项：系统的几种强调色。
 const COLORS: [u32; 9] = [0x5e5ce6, 0x007aff, 0xaf52de, 0xff2d55, 0xff3b30, 0xff9500, 0xffcc00, 0x34c759, 0x8e8e93];
 
+/// 要点两次才做的事，点过第一次的是哪一个。
+#[derive(PartialEq)]
+enum Confirm {
+    /// 清除学到的词。
+    Clear,
+    /// 删掉这个导入的外部词库。
+    Remove(String),
+}
+
 pub struct SettingsView {
     file: SettingsFile,
+    /// 本地词库的目录。外部词库的词数在这里记着，没改过的不再数。
+    dicts: LocalDicts,
     settings: Settings,
     /// 设置文件读不了、写不进去时的说明。
     error: Option<String>,
@@ -68,17 +88,37 @@ pub struct SettingsView {
     preview: Entity<CandidateView>,
     /// 用户词库里有几个词。
     learned_words: usize,
-    /// 已经点过一次「清除」，再点一次才真的清。
-    confirm_clear: bool,
+    /// 点过一次、等着再点一次的操作。
+    confirm: Option<Confirm>,
+    /// 自定义词库里有几个词。
+    custom_words: usize,
+    /// 安装包里的词库目录，自定义词库页定读音用。
+    dict_dir: Option<PathBuf>,
+    /// 「自定义词库」页，第一次点进去时建，之后留着：主词库不用再读一遍。
+    custom: Option<Entity<CustomWordsView>>,
+    /// 正显示着「自定义词库」页。
+    in_custom: bool,
+    /// 导入过的词库。
+    imported: Vec<Imported>,
+    /// 窗口最高多高：屏幕扣掉菜单栏和 Dock。内容比这高时，标题栏和底部不动，中间那部分滚动。
+    max_height: Pixels,
+    /// 正在导入，先不让再点。
+    importing: bool,
     focus: FocusHandle,
     _subscriptions: [Subscription; 2],
 }
 
 impl SettingsView {
+    /// `dicts`：和设置文件放在一起的本地词库目录，打开窗口时数过一遍词数的话就接着用。
     /// `default_font`：设置里没指定字体时用的平台默认中文字体，界面文字也用它。
+    /// `dict_dir`：安装包里的词库目录，自定义词库页用它给没写拼音的词定读音。
+    /// `max_height`：窗口最高多高，见 `size_for`。
     pub fn new(
         file: SettingsFile,
+        dicts: LocalDicts,
         default_font: impl Into<SharedString>,
+        dict_dir: Option<PathBuf>,
+        max_height: Pixels,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -111,6 +151,7 @@ impl SettingsView {
         focus.focus(window);
         let mut view = SettingsView {
             file,
+            dicts,
             settings: Settings::default(),
             error: None,
             default_font,
@@ -119,7 +160,14 @@ impl SettingsView {
             marked: String::new(),
             preview,
             learned_words: 0,
-            confirm_clear: false,
+            confirm: None,
+            custom_words: 0,
+            dict_dir,
+            custom: None,
+            in_custom: false,
+            imported: Vec::new(),
+            max_height,
+            importing: false,
             focus,
             _subscriptions: subscriptions,
         };
@@ -127,23 +175,27 @@ impl SettingsView {
         view
     }
 
-    /// 按这份设置，窗口内容该多大。预览跟着字号变高，窗口也跟着变；打开窗口前用它定大小。
-    pub fn size_for(settings: &Settings) -> Size<Pixels> {
-        let sections: f32 = SECTION_ROWS.iter().map(|&rows| HEADER + rows as f32 * ROW + CARD_BORDER).sum();
-        size(px(WIDTH), px(TITLEBAR + stage_height(settings) + sections + FOOTER))
+    /// 按这份设置和导入过几个词库，窗口内容该多大。预览跟着字号变高，窗口也跟着变；打开窗口前用它定大小。
+    /// 不超过 `max_height`（屏幕扣掉菜单栏和 Dock 的高度），放不下时中间那部分滚动。
+    pub fn size_for(settings: &Settings, imported: usize, max_height: Pixels) -> Size<Pixels> {
+        let mut rows = SECTION_ROWS;
+        rows[2] += imported.min(MAX_LISTED);
+        let sections: f32 = rows.iter().map(|&rows| HEADER + rows as f32 * ROW + CARD_BORDER).sum();
+        size(px(WIDTH), px(TITLEBAR + stage_height(settings) + sections + FOOTER).min(max_height))
     }
 
     /// 设置文件改过（或者还没读过）就重读。读不了时和输入法一样用默认设置，并显示原因。
-    /// 用户词库是输入法写的，每次都重数一遍有几个词。
+    /// 用户词库是输入法写的、本地词库可能刚在编辑器里改过，每次都重数一遍。
     fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.learned_words = self.userdict().count();
-        let (settings, error) = match self.file.reload() {
-            None => return,
-            Some(Ok(settings)) => (settings, None),
-            Some(Err(err)) => (Settings::default(), Some(err)),
-        };
-        self.settings = settings;
-        self.error = error;
+        self.custom_words = self.dicts.custom_words().len();
+        self.imported = self.dicts.imported();
+        if let Some(result) = self.file.reload() {
+            (self.settings, self.error) = match result {
+                Ok(settings) => (settings, None),
+                Err(err) => (Settings::default(), Some(err)),
+            };
+        }
         self.refresh(window, cx);
     }
 
@@ -151,7 +203,7 @@ impl SettingsView {
     fn change(&mut self, edit: &dyn Fn(&mut Settings), window: &mut Window, cx: &mut Context<Self>) {
         // 文件可能刚在别处改过，以文件里的为准再改
         self.reload(window, cx);
-        self.confirm_clear = false;
+        self.confirm = None;
         let mut next = self.settings.clone();
         edit(&mut next);
         let next = next.normalized();
@@ -180,7 +232,17 @@ impl SettingsView {
             self.preview.update(cx, |preview, _| preview.set(Content::Candidates(panel), appearance));
             self.marked = marked;
         }
-        window.resize(Self::size_for(&self.settings));
+        window.resize(Self::size_for(&self.settings, self.imported.len(), self.max_height));
+        // 正开着自定义词库页时重读：可能刚在编辑器里改过。没开着的话，点进去时会重读
+        if let Some(custom) = &self.custom {
+            let (accent, showing) = (self.settings.appearance.highlight_color, self.in_custom);
+            custom.update(cx, |custom, cx| {
+                custom.accent = accent;
+                if showing {
+                    custom.reload(cx);
+                }
+            });
+        }
         cx.notify();
     }
 
@@ -227,18 +289,8 @@ impl SettingsView {
     /// 「记住选过的词」一行的右边：学了几个词、清除，和开关。清除要点两次，免得手滑。
     fn learn_control(&self, p: &Palette, cx: &mut Context<Self>) -> Div {
         let clear = (self.learned_words > 0).then(|| {
-            let (label, color) = if self.confirm_clear {
-                ("再点一次清除".to_string(), p.error)
-            } else {
-                (format!("{} 个词 · 清除", self.learned_words), p.theme.secondary)
-            };
-            div()
-                .id("clear-learned")
-                .text_size(px(12.0))
-                .text_color(color)
-                .cursor_pointer()
-                .hover(|style| style.underline())
-                .child(label)
+            let label = format!("{} 个词 · 清除", self.learned_words);
+            confirm_link(p, "clear-learned", label, "再点一次清除", self.confirm == Some(Confirm::Clear))
                 .on_click(cx.listener(|view, _: &ClickEvent, _, cx| view.clear_learned(cx)))
         });
         div().flex().items_center().gap(px(12.0)).children(clear).child(
@@ -248,14 +300,118 @@ impl SettingsView {
 
     /// 清除学到的词：删掉用户词库的文件，输入法下次切换输入框时发现文件没了，就清空。
     fn clear_learned(&mut self, cx: &mut Context<Self>) {
-        if self.confirm_clear {
+        if self.confirmed(Confirm::Clear) {
             match self.userdict().clear() {
                 Ok(()) => self.learned_words = 0,
                 Err(err) => self.error = Some(format!("清除不了学到的词：{err}")),
             }
         }
-        self.confirm_clear = !self.confirm_clear;
         cx.notify();
+    }
+
+    /// 要点两次的操作：第一次点只记下来，返回 false；紧接着再点同一个才返回 true。
+    fn confirmed(&mut self, what: Confirm) -> bool {
+        if self.confirm.as_ref() == Some(&what) {
+            self.confirm = None;
+            true
+        } else {
+            self.confirm = Some(what);
+            false
+        }
+    }
+
+    /// 「自定义词库」一行的右边：有几个词，「管理」点进去加词、删词。
+    fn custom_control(&self, p: &Palette, cx: &mut Context<Self>) -> Div {
+        let count = (self.custom_words > 0).then(|| note(p, format!("{} 个词", self.custom_words)));
+        let manage = link("manage-custom", "管理", p.theme.accent)
+            .on_click(cx.listener(|view, _: &ClickEvent, window, cx| view.open_custom(window, cx)));
+        div().flex().items_center().gap(px(12.0)).children(count).child(manage)
+    }
+
+    /// 换到「自定义词库」页，光标放进「词」的输入框。
+    fn open_custom(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let custom = match &self.custom {
+            Some(custom) => custom.clone(),
+            None => {
+                let (dicts, dict_dir, accent) = (
+                    LocalDicts::beside(self.file.path()),
+                    self.dict_dir.clone(),
+                    self.settings.appearance.highlight_color,
+                );
+                let custom = cx.new(|cx| CustomWordsView::new(dicts, dict_dir, accent, cx));
+                cx.subscribe_in(&custom, window, |view, _, _: &Back, window, cx| {
+                    view.in_custom = false;
+                    // 回来时窗口拿回焦点，⌘W 才有地方派；词数跟着重数
+                    view.focus.focus(window);
+                    view.reload(window, cx);
+                })
+                .detach();
+                self.custom = Some(custom.clone());
+                custom
+            }
+        };
+        custom.update(cx, |custom, cx| {
+            custom.reload(cx);
+            custom.focus(window, cx);
+        });
+        self.in_custom = true;
+        cx.notify();
+    }
+
+    /// 「外部词库」一行的右边：选几个文件，在后台转好存进本地词库。
+    fn import_control(&self, p: &Palette, cx: &mut Context<Self>) -> Stateful<Div> {
+        if self.importing {
+            return div().id("import").child(note(p, "正在导入…"));
+        }
+        link("import", "导入…", p.theme.accent)
+            .on_click(cx.listener(|view, _: &ClickEvent, window, cx| view.import(window, cx)))
+    }
+
+    fn import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("导入".into()),
+        });
+        let dicts = LocalDicts::beside(self.file.path());
+        cx.spawn_in(window, async move |view, cx| {
+            let Ok(Ok(Some(paths))) = picked.await else { return };
+            let _ = view.update(cx, |view, cx| {
+                view.importing = true;
+                cx.notify();
+            });
+            let results = cx
+                .background_executor()
+                .spawn(async move { paths.iter().map(|path| dicts.import(path)).collect::<Vec<_>>() })
+                .await;
+            let _ = view.update_in(cx, |view, window, cx| {
+                view.importing = false;
+                view.error = results.into_iter().find_map(Result::err);
+                view.reload(window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// 一个导入的词库那一行的右边：有几个词、删除。删除要点两次，免得手滑。
+    fn remove_control(&self, dict: &Imported, p: &Palette, cx: &mut Context<Self>) -> Div {
+        let name = dict.name.clone();
+        let confirming = self.confirm == Some(Confirm::Remove(name.clone()));
+        let id = ElementId::Name(format!("remove-{name}").into());
+        let remove = confirm_link(p, id, "删除".into(), "再点一次删除", confirming).on_click(cx.listener(
+            move |view, _: &ClickEvent, window, cx| {
+                if view.confirmed(Confirm::Remove(name.clone())) {
+                    if let Err(err) = view.dicts.remove(&name) {
+                        view.error = Some(format!("删不了「{name}」：{err}"));
+                    }
+                    view.reload(window, cx);
+                } else {
+                    cx.notify();
+                }
+            },
+        ));
+        div().flex().items_center().gap(px(12.0)).child(note(p, format!("{} 个词", dict.words))).child(remove)
     }
 
     fn page_picker(&self, p: &Palette, cx: &mut Context<Self>) -> Div {
@@ -362,14 +518,9 @@ impl SettingsView {
             .gap(px(16.0))
             .text_size(px(12.0))
             .child(
-                div()
-                    .id("open-file")
+                link("open-file", "打开设置文件", p.theme.accent)
                     .flex_none()
-                    .text_color(p.theme.accent)
-                    .cursor_pointer()
-                    .hover(|style| style.underline())
-                    .child("打开设置文件")
-                    .on_click(move |_, _, cx| cx.open_with_system(&path)),
+                    .on_click(move |_, _, cx| open_text(path.clone(), cx)),
             )
             .child(note.min_w(px(0.0)).truncate())
     }
@@ -378,6 +529,11 @@ impl SettingsView {
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::new(window.appearance(), self.settings.appearance.highlight_color);
+        if self.in_custom
+            && let Some(custom) = &self.custom
+        {
+            return self.frame(&p, "自定义词库").child(custom.clone());
+        }
         let input = &self.settings.input;
         let input_rows: [Div; SECTION_ROWS[0]] = [
             row(&p, true, "每页候选", self.page_picker(&p, cx)),
@@ -401,8 +557,41 @@ impl Render for SettingsView {
             row(&p, false, "字体", self.font_picker(&p, cx)),
             row(&p, false, "高亮色", self.color_picker(cx)),
         ];
-        let sections: [Div; SECTION_ROWS.len()] =
-            [section(&p, "输入", input_rows), section(&p, "外观", appearance_rows)];
+        let dict_rows: [Div; SECTION_ROWS[2]] = [
+            row(&p, true, "自定义词库", self.custom_control(&p, cx)),
+            row(
+                &p,
+                false,
+                described(&p, "外部词库", "搜狗细胞词库 .scel、Rime .dict.yaml、文本词表"),
+                self.import_control(&p, cx),
+            ),
+        ];
+        let listed: Vec<Div> = self
+            .imported
+            .iter()
+            .map(|dict| row(&p, false, dict.name.clone(), self.remove_control(dict, &p, cx)))
+            .collect();
+        let listed = (!listed.is_empty())
+            .then(|| div().id("imported").max_h(px(MAX_LISTED as f32 * ROW)).overflow_y_scroll().children(listed));
+        let sections: [Div; SECTION_ROWS.len()] = [
+            section(&p, "输入", card(&p).children(input_rows)),
+            section(&p, "外观", card(&p).children(appearance_rows)),
+            section(&p, "词库", card(&p).children(dict_rows).children(listed)),
+        ];
+        // 屏幕不够高时，标题栏和底部不动，中间这部分滚动
+        let body = div()
+            .id("body")
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_y_scroll()
+            .child(div().flex().flex_col().child(self.stage(&p, window, cx)).children(sections));
+        self.frame(&p, "Kyme 设置").child(body).child(self.footer(&p))
+    }
+}
+
+impl SettingsView {
+    /// 整个窗口：底色、字体，最上面是标题栏。下面接着放这一页的内容。
+    fn frame(&self, p: &Palette, title: &'static str) -> Div {
         div()
             .track_focus(&self.focus)
             .size_full()
@@ -414,16 +603,14 @@ impl Render for SettingsView {
             .child(
                 div()
                     .h(px(TITLEBAR))
+                    .flex_none()
                     .flex()
                     .items_center()
                     .justify_center()
                     .text_size(px(13.0))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child("Kyme 设置"),
+                    .child(title),
             )
-            .child(self.stage(&p, window, cx))
-            .children(sections)
-            .child(self.footer(&p))
     }
 }
 
@@ -442,7 +629,7 @@ fn on_change(
 }
 
 /// 一组设置：小标题，下面一张卡片。
-fn section<const ROWS: usize>(p: &Palette, title: &'static str, rows: [Div; ROWS]) -> Div {
+fn section(p: &Palette, title: &'static str, card: Div) -> Div {
     div()
         .mx(px(MARGIN))
         .flex()
@@ -459,11 +646,16 @@ fn section<const ROWS: usize>(p: &Palette, title: &'static str, rows: [Div; ROWS
                 .text_color(p.theme.secondary)
                 .child(title),
         )
-        .child(div().flex().flex_col().rounded(px(10.0)).border_1().border_color(p.line).bg(p.card).children(rows))
+        .child(card)
 }
 
-/// 卡片里的一行：左边是名字，右边是控件。除了第一行，上面有一条从文字处开始的分隔线。
-fn row(p: &Palette, first: bool, label: &'static str, control: impl IntoElement) -> Div {
+/// 放一组设置的卡片，一行一行往里加。
+fn card(p: &Palette) -> Div {
+    div().flex().flex_col().rounded(px(10.0)).border_1().border_color(p.line).bg(p.card)
+}
+
+/// 卡片里的一行：左边是名字（太长就截断），右边是控件。除了第一行，上面有一条从文字处开始的分隔线。
+fn row(p: &Palette, first: bool, label: impl IntoElement, control: impl IntoElement) -> Div {
     div().h(px(ROW)).pl(px(14.0)).child(
         div()
             .size_full()
@@ -471,10 +663,61 @@ fn row(p: &Palette, first: bool, label: &'static str, control: impl IntoElement)
             .flex()
             .items_center()
             .justify_between()
+            .gap(px(12.0))
             .when(!first, |row| row.border_t_1().border_color(p.line))
-            .child(div().text_size(px(13.0)).child(label))
-            .child(control),
+            .child(div().min_w(px(0.0)).truncate().text_size(px(13.0)).child(label))
+            .child(div().flex_none().child(control)),
     )
+}
+
+/// 名字下面再带一行小字说明。
+fn described(p: &Palette, label: &'static str, detail: &'static str) -> Div {
+    div().flex().flex_col().child(label).child(div().text_size(px(11.0)).text_color(p.theme.secondary).child(detail))
+}
+
+/// 行里的说明文字，比如有几个词。
+fn note(p: &Palette, text: impl Into<SharedString>) -> Div {
+    div().text_size(px(12.0)).text_color(p.theme.secondary).child(text.into())
+}
+
+/// 要点两次的链接：点过一次后变成红字的「再点一次……」。
+fn confirm_link(
+    p: &Palette,
+    id: impl Into<ElementId>,
+    label: String,
+    again: &'static str,
+    confirming: bool,
+) -> Stateful<Div> {
+    if confirming { link(id, again, p.error) } else { link(id, label, p.theme.secondary) }
+}
+
+/// 能点的文字。
+fn link(id: impl Into<ElementId>, label: impl Into<SharedString>, color: Hsla) -> Stateful<Div> {
+    div()
+        .id(id)
+        .text_size(px(12.0))
+        .text_color(color)
+        .cursor_pointer()
+        .hover(|style| style.underline())
+        .child(label.into())
+}
+
+/// 用默认的 App 打开文本文件。macOS 上这种扩展名没设默认 App（.toml、.yaml 常常没有）时，改用文本编辑打开。
+fn open_text(path: PathBuf, cx: &App) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = cx;
+        std::thread::spawn(move || {
+            let open = |args: &[&std::ffi::OsStr]| {
+                std::process::Command::new("open").args(args).status().is_ok_and(|status| status.success())
+            };
+            if !open(&[path.as_os_str()]) {
+                open(&["-t".as_ref(), path.as_os_str()]);
+            }
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    cx.open_with_system(&path);
 }
 
 /// 分段控件的底。

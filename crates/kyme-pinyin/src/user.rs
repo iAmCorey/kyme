@@ -3,11 +3,9 @@
 //! 纯数据：不读文件也不看时钟，今天是哪天、什么时候存盘都由调用方决定。词的代价和主词库直接可比，
 //! 组句时和主词库的词放在一起比。
 
-use crate::dict::{Dictionary, EXACT_SLOTS, KeyIndex, abbr_key_of, abbr_prefix, exact_key, exact_prefix};
+use crate::dict::{EXACT_SLOTS, KeyIndex, TYPICAL_WEIGHT, abbr_key_of, abbr_prefix, exact_key, exact_prefix};
+use crate::engine::Engine;
 use crate::syllable::SylId;
-
-/// 主词库里没有的新词，按词库里词频的中位数起算。
-const NEW_WORD_WEIGHT: f64 = 500.0;
 /// 加分的上限：选得再多，也不该压过所有常用词。
 const MAX_BONUS: f64 = 6.0;
 /// 最多记多少个词，超出时淘汰选得最少的。
@@ -43,7 +41,8 @@ fn bonus(count: f64) -> f64 {
 
 pub struct UserDict {
     words: Vec<UserWord>,
-    /// 每个词的基础代价：主词库里有的词用它在主词库的代价，新词按中位数词频算。学词时只改次数，不用再查主词库。
+    /// 每个词的基础代价：主词库、本地词库里有的词用它在词库里的代价，新词按中位数词频算。
+    /// 学词时只改次数，不用再查词库；词库换了要整个重建。
     bases: Vec<f64>,
     /// 每个词的代价：基础代价减去加分。
     costs: Vec<f64>,
@@ -65,20 +64,20 @@ impl UserDict {
         }
     }
 
-    /// 从读出来的词建。超过上限时留下选得多的。
-    pub fn new(dict: &Dictionary, mut words: Vec<UserWord>) -> Self {
+    /// 从读出来的词建，代价按 `engine` 的词库算。超过上限时留下选得多的。
+    pub fn new(engine: &Engine, mut words: Vec<UserWord>) -> Self {
         words.retain(|word| (1..=MAX_SYLLABLES).contains(&word.syllables.len()));
         if words.len() > MAX_WORDS {
             words.sort_by(|a, b| b.count.total_cmp(&a.count));
             words.truncate(MAX_WORDS);
         }
-        let bases: Vec<f64> = words.iter().map(|word| base_cost(dict, word)).collect();
+        let bases: Vec<f64> = words.iter().map(|word| base_cost(engine, word)).collect();
         let costs = words.iter().zip(&bases).map(|(word, base)| base - bonus(word.count)).collect();
         let keys = |key_of: &dyn Fn(&UserWord) -> Option<u64>| {
             KeyIndex::build(words.iter().enumerate().filter_map(|(i, word)| Some((key_of(word)?, i as u32))).collect())
         };
         let exact = keys(&|word| exact_key(&word.syllables));
-        let abbr = keys(&|word| abbr_key_of(&initials(dict, &word.syllables)));
+        let abbr = keys(&|word| abbr_key_of(&initials(engine, &word.syllables)));
         let day = words.iter().map(|word| word.day).max().unwrap_or(0);
         UserDict { words, bases, costs, exact, abbr, day }
     }
@@ -87,12 +86,16 @@ impl UserDict {
         &self.words
     }
 
+    pub fn into_words(self) -> Vec<UserWord> {
+        self.words
+    }
+
     pub fn is_empty(&self) -> bool {
         self.words.is_empty()
     }
 
     /// 记一次「选了这个词」，返回记没记。空的、音节太多的不记。
-    pub fn learn(&mut self, dict: &Dictionary, text: &str, syllables: &[SylId], day: u32) -> bool {
+    pub fn learn(&mut self, engine: &Engine, text: &str, syllables: &[SylId], day: u32) -> bool {
         if !(1..=MAX_SYLLABLES).contains(&syllables.len()) {
             return false;
         }
@@ -111,13 +114,13 @@ impl UserDict {
                         words.swap_remove(fewest);
                     }
                     words.push(word);
-                    *self = UserDict::new(dict, words);
+                    *self = UserDict::new(engine, words);
                     return true;
                 }
                 let index = self.words.len();
                 self.exact.insert(exact_key(syllables), index as u32);
-                self.abbr.insert(abbr_key_of(&initials(dict, syllables)), index as u32);
-                self.bases.push(base_cost(dict, &word));
+                self.abbr.insert(abbr_key_of(&initials(engine, syllables)), index as u32);
+                self.bases.push(base_cost(engine, &word));
                 self.costs.push(0.0);
                 self.words.push(word);
                 index
@@ -179,34 +182,38 @@ impl Default for UserDict {
     }
 }
 
-fn base_cost(dict: &Dictionary, word: &UserWord) -> f64 {
-    dict.find(&word.text, &word.syllables).map_or(dict.cost_of_weight(NEW_WORD_WEIGHT), |entry| dict.cost(entry))
+fn base_cost(engine: &Engine, word: &UserWord) -> f64 {
+    engine
+        .word_cost(&word.text, &word.syllables)
+        .unwrap_or_else(|| engine.dictionary().cost_of_weight(f64::from(TYPICAL_WEIGHT)))
 }
 
-fn initials(dict: &Dictionary, syllables: &[SylId]) -> Vec<u8> {
-    syllables.iter().map(|&id| dict.table().initial(id)).collect()
+fn initials(engine: &Engine, syllables: &[SylId]) -> Vec<u8> {
+    syllables.iter().map(|&id| engine.dictionary().table().initial(id)).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn dict() -> Dictionary {
-        Dictionary::from_rime_sources(&["你\tni\t1000\n泥\tni\t50\n"])
+    use crate::dict::Dictionary;
+
+    fn engine() -> Engine {
+        Engine::new(Dictionary::from_rime_sources(&["你\tni\t1000\n泥\tni\t50\n"]))
     }
 
-    fn ni(dict: &Dictionary) -> Vec<SylId> {
-        vec![dict.table().exact("ni").unwrap()]
+    fn ni(engine: &Engine) -> Vec<SylId> {
+        vec![engine.dictionary().table().exact("ni").unwrap()]
     }
 
     #[test]
     fn every_word_ages_when_the_day_changes() {
-        let dict = dict();
+        let engine = engine();
         let mut user = UserDict::default();
-        user.learn(&dict, "你", &ni(&dict), 0);
-        user.learn(&dict, "泥", &ni(&dict), 0);
+        user.learn(&engine, "你", &ni(&engine), 0);
+        user.learn(&engine, "泥", &ni(&engine), 0);
         // 120 天后再选「泥」：「你」也一起折算，剩四分之一
-        user.learn(&dict, "泥", &ni(&dict), 120);
+        user.learn(&engine, "泥", &ni(&engine), 120);
         let count = |text: &str| user.words().iter().find(|word| word.text == text).unwrap().count;
         assert!((count("你") - 0.25).abs() < 1e-9);
         assert!((count("泥") - 1.25).abs() < 1e-9);
@@ -214,14 +221,14 @@ mod tests {
 
     #[test]
     fn a_full_dictionary_still_takes_new_words() {
-        let dict = dict();
+        let engine = engine();
         let words = (0..MAX_WORDS)
-            .map(|i| UserWord { text: format!("词{i}"), syllables: ni(&dict), count: 2.0, day: 0 })
+            .map(|i| UserWord { text: format!("词{i}"), syllables: ni(&engine), count: 2.0, day: 0 })
             .collect();
-        let mut user = UserDict::new(&dict, words);
-        user.learn(&dict, "泥", &ni(&dict), 0);
+        let mut user = UserDict::new(&engine, words);
+        user.learn(&engine, "泥", &ni(&engine), 0);
         assert_eq!(user.words().len(), MAX_WORDS);
-        user.learn(&dict, "泥", &ni(&dict), 0);
+        user.learn(&engine, "泥", &ni(&engine), 0);
         let ni = user.words().iter().find(|word| word.text == "泥").expect("新词没被挤掉");
         assert_eq!(ni.count, 2.0, "再选一次接着累计");
     }

@@ -4,7 +4,8 @@
 //! 一次二分查找就能判断有没有，切分时用它剪枝。
 
 use std::cmp::Reverse;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::{fmt, fs, io};
 
 use crate::syllable::{SylId, SyllableTable};
@@ -15,6 +16,10 @@ const EXACT_BITS: u32 = 10;
 /// 简拼索引最多支持 12 个音节，每个首字母（a–z 记作 1–26）占 5 bit。
 const ABBR_SLOTS: usize = 12;
 const ABBR_BITS: u32 = 5;
+/// 自带词库词频的中位数，用来给不知道词频的词定个中等的代价：学到的新词、导入的外部词库。
+pub(crate) const TYPICAL_WEIGHT: u32 = 500;
+/// 词库文件的扩展名，Rime 的写法。
+pub const DICT_SUFFIX: &str = ".dict.yaml";
 
 #[derive(Clone, Copy)]
 struct Entry {
@@ -38,6 +43,9 @@ pub struct Dictionary {
     /// 判断「有没有以这几个音节开头的词」时要一起查，不然它们会在切分时被提前剪掉。
     long_prefixes: Vec<u64>,
     ln_total: f64,
+    /// 按文字查词条：全部词条按文字排序，同一个写法只留最常用的读音。给没写拼音的本地词补读音用，
+    /// 第一次用到时才建。
+    by_text: OnceLock<Vec<u32>>,
 }
 
 #[derive(Debug)]
@@ -64,6 +72,16 @@ impl LoadError {
     }
 }
 
+/// 目录里的词库文件，按文件名排序。
+pub fn dict_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut paths: Vec<PathBuf> = fs::read_dir(dir)?
+        .filter_map(|entry| Some(entry.ok()?.path()))
+        .filter(|path| path.to_string_lossy().ends_with(DICT_SUFFIX))
+        .collect();
+    paths.sort();
+    Ok(paths)
+}
+
 /// 读整个文件，出错时带上路径。
 pub(crate) fn read_file(path: &Path) -> Result<String, LoadError> {
     fs::read_to_string(path).map_err(|source| LoadError::new(path, source))
@@ -75,19 +93,30 @@ struct Row<'a> {
     weight: u32,
 }
 
-/// 逐行读出词条。YAML 头以单独一行 `...` 结束，没有头就从第一行读。
+/// 去掉 YAML 头，剩下的是词条。头以单独一行 `...` 结束，没有头就是整个文件。
+pub(crate) fn body(content: &str) -> &str {
+    content.split_once("\n...\n").map_or(content, |(_, body)| body)
+}
+
+/// 逐行读出词条。
 fn rows(content: &str) -> impl Iterator<Item = Row<'_>> {
-    let body = content.split_once("\n...\n").map_or(content, |(_, body)| body);
-    body.lines().filter_map(|line| {
+    body(content).lines().filter_map(|line| {
         if line.is_empty() || line.starts_with('#') {
             return None;
         }
         let mut cols = line.split('\t');
         let text = cols.next()?;
         let code = cols.next()?;
-        let weight = cols.next().and_then(|w| w.trim().trim_end_matches('%').parse::<f64>().ok()).unwrap_or(0.0) as u32;
+        let weight = cols.next().and_then(weight).unwrap_or(0);
         Some(Row { text, code, weight })
     })
+}
+
+/// 词频那一列：一串数字，可以带小数点，或者像 Rime 那样带百分号。`nan` 这种既是音节又能当数字读的不算。
+pub(crate) fn weight(token: &str) -> Option<u32> {
+    let digits = token.trim().trim_end_matches('%');
+    let numeric = !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit() || b == b'.');
+    numeric.then(|| digits.parse::<f64>().ok()).flatten().map(|weight| weight.min(f64::from(u32::MAX)) as u32)
 }
 
 /// 把若干值从最高位起依次放进 `slots` 个 `bits` 位宽的格子，后面空着的格子是 0。
@@ -180,46 +209,36 @@ impl KeyIndex {
     }
 }
 
-impl Dictionary {
-    pub fn load_rime<P: AsRef<Path>>(paths: &[P]) -> Result<Self, LoadError> {
-        let contents = paths.iter().map(|path| read_file(path.as_ref())).collect::<Result<Vec<_>, _>>()?;
-        Ok(Self::from_rime_sources(&contents.iter().map(String::as_str).collect::<Vec<_>>()))
+/// 建词库时先把词条攒在这里，最后一起排序、建索引。主词库和本地词库共用。
+#[derive(Default)]
+pub(crate) struct Builder {
+    texts: String,
+    syls: Vec<SylId>,
+    entries: Vec<Entry>,
+}
+
+impl Builder {
+    /// 加一个词。没有读音、读音或文字太长的不要。
+    pub(crate) fn push(&mut self, text: &str, ids: &[SylId], weight: u32) {
+        if ids.is_empty() || ids.len() > usize::from(u8::MAX) || text.len() > usize::from(u16::MAX) {
+            return;
+        }
+        self.entries.push(Entry {
+            text_off: self.texts.len() as u32,
+            syl_off: self.syls.len() as u32,
+            weight,
+            text_len: text.len() as u16,
+            syl_len: ids.len() as u8,
+        });
+        self.texts.push_str(text);
+        self.syls.extend_from_slice(ids);
     }
 
-    pub fn from_rime_sources(sources: &[&str]) -> Self {
-        let mut table = SyllableTable::default();
-        let mut texts = String::new();
-        let mut syls = Vec::new();
-        let mut parsed = Vec::new();
-        let mut ids = Vec::new();
-        for source in sources {
-            'rows: for row in rows(source) {
-                ids.clear();
-                for spelling in row.code.split(' ') {
-                    match table.intern(spelling) {
-                        Some(id) => ids.push(id),
-                        None => continue 'rows,
-                    }
-                }
-                if ids.is_empty() || ids.len() > usize::from(u8::MAX) || row.text.len() > usize::from(u16::MAX) {
-                    continue;
-                }
-                parsed.push(Entry {
-                    text_off: texts.len() as u32,
-                    syl_off: syls.len() as u32,
-                    weight: row.weight,
-                    text_len: row.text.len() as u16,
-                    syl_len: ids.len() as u8,
-                });
-                texts.push_str(row.text);
-                syls.extend_from_slice(&ids);
-            }
-        }
-        table.finish();
-
+    /// 排序、建索引。`ln_total` 是 None 时按这些词自己的总词频算代价。
+    fn build(self, table: SyllableTable, ln_total: Option<f64>) -> Dictionary {
+        let Builder { texts, syls, mut entries } = self;
         let ids_of = |e: &Entry| &syls[e.syl_off as usize..][..usize::from(e.syl_len)];
         let exact_key_of = |e: &Entry| exact_key(ids_of(e)).unwrap_or(u64::MAX);
-        let mut entries = parsed;
         // 稳定排序：同 key 同词频时保持读入顺序
         entries.sort_by_cached_key(|e| (exact_key_of(e), Reverse(e.weight)));
         let exact_keys: Vec<u64> = entries.iter().map(exact_key_of).collect();
@@ -242,9 +261,45 @@ impl Dictionary {
             .collect();
         long_prefixes.sort_unstable();
         long_prefixes.dedup();
-        let total: f64 = entries.iter().map(|e| f64::from(e.weight) + 1.0).sum();
+        let ln_total = ln_total.unwrap_or_else(|| {
+            let total: f64 = entries.iter().map(|e| f64::from(e.weight) + 1.0).sum();
+            total.max(1.0).ln()
+        });
 
-        Dictionary { table, texts, syls, entries, exact_keys, abbr, long_prefixes, ln_total: total.max(1.0).ln() }
+        Dictionary { table, texts, syls, entries, exact_keys, abbr, long_prefixes, ln_total, by_text: OnceLock::new() }
+    }
+}
+
+impl Dictionary {
+    pub fn load_rime<P: AsRef<Path>>(paths: &[P]) -> Result<Self, LoadError> {
+        let contents = paths.iter().map(|path| read_file(path.as_ref())).collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::from_rime_sources(&contents.iter().map(String::as_str).collect::<Vec<_>>()))
+    }
+
+    pub fn from_rime_sources(sources: &[&str]) -> Self {
+        let mut table = SyllableTable::default();
+        let mut words = Builder::default();
+        let mut ids = Vec::new();
+        for source in sources {
+            'rows: for row in rows(source) {
+                ids.clear();
+                for spelling in row.code.split(' ') {
+                    match table.intern(spelling) {
+                        Some(id) => ids.push(id),
+                        None => continue 'rows,
+                    }
+                }
+                words.push(row.text, &ids, row.weight);
+            }
+        }
+        table.finish();
+        words.build(table, None)
+    }
+
+    /// 和这个词库共用音节表和总词频的另一套词（本地词库）：两边的代价是同一个尺度，可以放在一起比，
+    /// 加了词也不会改变这个词库里每个词的代价。
+    pub(crate) fn sibling(&self, words: Builder) -> Dictionary {
+        words.build(self.table.clone(), Some(self.ln_total))
     }
 
     pub fn table(&self) -> &SyllableTable {
@@ -277,6 +332,20 @@ impl Dictionary {
     /// 词频为 `weight` 的词的代价。
     pub(crate) fn cost_of_weight(&self, weight: f64) -> f64 {
         self.ln_total - (weight + 1.0).ln()
+    }
+
+    /// 文字是 `text` 的词条，同一个写法有几个读音的（「行」xing、hang）取最常用的。
+    /// 第一次调用时建索引（主词库约 0.1 秒、2 MB），之后一直留着。
+    pub(crate) fn find_text(&self, text: &str) -> Option<u32> {
+        let index = self.by_text.get_or_init(|| {
+            let weight = |entry: u32| self.entries[entry as usize].weight;
+            let mut index: Vec<u32> = (0..self.entries.len() as u32).collect();
+            index.sort_unstable_by(|&a, &b| self.text(a).cmp(self.text(b)).then(weight(b).cmp(&weight(a))));
+            // 同一个写法只留排在最前、也就是最常用的那个
+            index.dedup_by(|later, kept| self.text(*later) == self.text(*kept));
+            index
+        });
+        index.binary_search_by(|&entry| self.text(entry).cmp(text)).ok().map(|at| index[at])
     }
 
     /// 读音为 `ids`、文字为 `text` 的词条。

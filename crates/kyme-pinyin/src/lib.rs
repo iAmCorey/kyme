@@ -7,10 +7,11 @@
 mod dict;
 mod emoji;
 mod engine;
+pub mod local;
 mod syllable;
 mod user;
 
-pub use dict::{Dictionary, LoadError};
+pub use dict::{DICT_SUFFIX, Dictionary, LoadError, dict_files};
 pub use emoji::Emoji;
 pub use engine::{Candidate, Conversion, Engine};
 pub use syllable::{SylId, SyllableTable};

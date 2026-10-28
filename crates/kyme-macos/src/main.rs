@@ -22,8 +22,8 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use gpui::{App, Application};
+use kyme_core::SettingsFile;
 use kyme_core::pinyin::{Dictionary, Engine};
-use kyme_core::{SettingsFile, UserDictFile};
 use objc2::rc::Retained;
 use objc2::{AnyThread, MainThreadMarker};
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
@@ -62,8 +62,7 @@ fn main() {
     // 输入法在跑的时候再打开一次 Kyme.app（启动台、Spotlight、访达）：打开设置
     app.on_reopen(|_| settings_window::open());
     app.run(move |cx| {
-        let userdict = UserDictFile::beside(&settings_path());
-        boot(cx, loading, SettingsFile::new(settings_path()), Some(userdict));
+        boot(cx, loading, SettingsFile::new(settings_path()), true);
         power::watch();
         match start_server() {
             // IMKServer 要在整个进程生命周期里一直存在
@@ -87,30 +86,39 @@ fn settings_path() -> PathBuf {
     library_dir().unwrap_or_default().join("Application Support/Kyme/settings.toml")
 }
 
+/// 安装包里的词库目录 `Contents/Resources/dict`。
+fn bundled_dict_dir() -> Option<PathBuf> {
+    NSBundle::mainBundle().resourcePath().map(|resources| PathBuf::from(resources.to_string()).join("dict"))
+}
+
 /// 词库在后台线程里读，同时初始化 GPUI 和候选窗。
 fn load_engine_in_background() -> JoinHandle<Engine> {
-    let dict_dir =
-        NSBundle::mainBundle().resourcePath().map(|resources| PathBuf::from(resources.to_string()).join("dict"));
+    let dict_dir = bundled_dict_dir();
     std::thread::spawn(move || load_engine(dict_dir.as_deref()))
 }
 
 /// 输入法和自测模式共用的启动：设成后台 App，建候选窗，等词库读完，装好全局状态。
-fn boot(cx: &mut App, loading: JoinHandle<Engine>, settings: SettingsFile, userdict: Option<UserDictFile>) {
+/// `user_data`：读写用户词库和本地词库，自测模式不读也不写。
+fn boot(cx: &mut App, loading: JoinHandle<Engine>, settings: SettingsFile, user_data: bool) {
     let mtm = MainThreadMarker::new().expect("GPUI 的启动回调在主线程");
     // GPUI 启动时把激活策略设成 Regular（会出现 Dock 图标），输入法要改回来
     let _ = NSApplication::sharedApplication(mtm).setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
     let panel = panel::PanelWindow::open(cx, state::pick);
     let engine = Arc::new(loading.join().expect("读词库的线程崩溃了"));
-    // 构建词库时的临时内存是在另一个线程分配的，释放后 malloc 不会主动还给系统
-    // SAFETY: 传 NULL 表示处理全部 malloc zone，0 表示尽量多还
-    unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
-    state::install(state::AppState::new(engine, panel, cx.to_async(), settings, userdict));
+    release_memory();
+    state::install(state::AppState::new(engine, panel, cx.to_async(), settings, user_data));
 }
 
 unsafe extern "C" {
     /// libmalloc：把空闲的脏页还给系统，返回还了多少字节。
     fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+}
+
+/// 建好词库以后调用：构建时的临时内存是在另一个线程分配的，释放后 malloc 不会主动还给系统。
+fn release_memory() {
+    // SAFETY: 传 NULL 表示处理全部 malloc zone，0 表示尽量多还
+    unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
 }
 
 /// `~/Library`
