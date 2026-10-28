@@ -49,6 +49,8 @@ pub struct UserDict {
     costs: Vec<f64>,
     exact: KeyIndex,
     abbr: KeyIndex,
+    /// 所有词的次数都折算到了这一天。
+    day: u32,
 }
 
 impl UserDict {
@@ -59,6 +61,7 @@ impl UserDict {
             costs: Vec::new(),
             exact: KeyIndex::new(),
             abbr: KeyIndex::new(),
+            day: 0,
         }
     }
 
@@ -76,7 +79,8 @@ impl UserDict {
         };
         let exact = keys(&|word| exact_key(&word.syllables));
         let abbr = keys(&|word| abbr_key_of(&initials(dict, &word.syllables)));
-        UserDict { words, bases, costs, exact, abbr }
+        let day = words.iter().map(|word| word.day).max().unwrap_or(0);
+        UserDict { words, bases, costs, exact, abbr, day }
     }
 
     pub fn words(&self) -> &[UserWord] {
@@ -92,18 +96,20 @@ impl UserDict {
         if !(1..=MAX_SYLLABLES).contains(&syllables.len()) {
             return false;
         }
+        self.age_to(day);
         let index = match self.words.iter().position(|word| word.text == text && word.syllables == syllables) {
             Some(index) => {
-                let word = &mut self.words[index];
-                word.decay_to(day);
-                word.count += 1.0;
+                self.words[index].count += 1.0;
                 index
             }
             None => {
                 let word = UserWord { text: text.into(), syllables: syllables.to_vec(), count: 1.0, day };
-                // 满了就丢掉选得最少的，整个重建；没满只要把新词插进索引
+                // 满了：先淘汰一个选得最少的老词，再放新词进来，整个重建。不然新词一进来就被挤掉，永远学不会
                 if self.words.len() >= MAX_WORDS {
                     let mut words = std::mem::take(&mut self.words);
+                    if let Some(fewest) = (0..words.len()).min_by(|&a, &b| words[a].count.total_cmp(&words[b].count)) {
+                        words.swap_remove(fewest);
+                    }
                     words.push(word);
                     *self = UserDict::new(dict, words);
                     return true;
@@ -119,6 +125,19 @@ impl UserDict {
         };
         self.costs[index] = self.bases[index] - bonus(self.words[index].count);
         true
+    }
+
+    /// 日子变了，把所有词的次数统一折算到 `day`，代价跟着重算。不然只有刚选的那个词在衰减，
+    /// 很久没用的词再选一次反而排得更低。一天最多做一次。
+    fn age_to(&mut self, day: u32) {
+        if day <= self.day {
+            return;
+        }
+        for ((word, base), cost) in self.words.iter_mut().zip(&self.bases).zip(&mut self.costs) {
+            word.decay_to(day);
+            *cost = base - bonus(word.count);
+        }
+        self.day = day;
     }
 
     pub(crate) fn text(&self, word: u32) -> &str {
@@ -166,4 +185,44 @@ fn base_cost(dict: &Dictionary, word: &UserWord) -> f64 {
 
 fn initials(dict: &Dictionary, syllables: &[SylId]) -> Vec<u8> {
     syllables.iter().map(|&id| dict.table().initial(id)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dict() -> Dictionary {
+        Dictionary::from_rime_sources(&["你\tni\t1000\n泥\tni\t50\n"])
+    }
+
+    fn ni(dict: &Dictionary) -> Vec<SylId> {
+        vec![dict.table().exact("ni").unwrap()]
+    }
+
+    #[test]
+    fn every_word_ages_when_the_day_changes() {
+        let dict = dict();
+        let mut user = UserDict::default();
+        user.learn(&dict, "你", &ni(&dict), 0);
+        user.learn(&dict, "泥", &ni(&dict), 0);
+        // 120 天后再选「泥」：「你」也一起折算，剩四分之一
+        user.learn(&dict, "泥", &ni(&dict), 120);
+        let count = |text: &str| user.words().iter().find(|word| word.text == text).unwrap().count;
+        assert!((count("你") - 0.25).abs() < 1e-9);
+        assert!((count("泥") - 1.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_full_dictionary_still_takes_new_words() {
+        let dict = dict();
+        let words = (0..MAX_WORDS)
+            .map(|i| UserWord { text: format!("词{i}"), syllables: ni(&dict), count: 2.0, day: 0 })
+            .collect();
+        let mut user = UserDict::new(&dict, words);
+        user.learn(&dict, "泥", &ni(&dict), 0);
+        assert_eq!(user.words().len(), MAX_WORDS);
+        user.learn(&dict, "泥", &ni(&dict), 0);
+        let ni = user.words().iter().find(|word| word.text == "泥").expect("新词没被挤掉");
+        assert_eq!(ni.count, 2.0, "再选一次接着累计");
+    }
 }

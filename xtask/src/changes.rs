@@ -29,20 +29,19 @@ const RULES: &[(&str, &[Check])] = &[
     ("LICENSE", &[Check::Bundle]),
 ];
 
-/// 还没推送的改动碰到的文件。
-pub fn files(root: &Path) -> Vec<String> {
-    let git = |args: &[&str]| util::stdout_of(Command::new("git").args(args).current_dir(root)).unwrap_or_default();
-    let mut files: Vec<String> = [
-        git(&["diff", "--name-only", "HEAD"]),
-        git(&["ls-files", "--others", "--exclude-standard"]),
-        git(&["diff", "--name-only", "@{upstream}...HEAD"]),
-    ]
-    .iter()
-    .flat_map(|out| out.lines().map(str::to_string).collect::<Vec<_>>())
-    .collect();
+/// 还没推送的改动碰到的文件。没设上游的分支和 origin/main 比；git 出错、比不了时返回 None，调用方全跑：
+/// 查不出改了什么，不能当成什么都没改。
+pub fn files(root: &Path) -> Option<Vec<String>> {
+    let git = |args: &[&str]| util::stdout_of(Command::new("git").args(args).current_dir(root));
+    let unpushed = git(&["diff", "--name-only", "@{upstream}...HEAD"])
+        .or_else(|| git(&["diff", "--name-only", "origin/main...HEAD"]))?;
+    let working = git(&["diff", "--name-only", "HEAD"])?;
+    let untracked = git(&["ls-files", "--others", "--exclude-standard"])?;
+    let mut files: Vec<String> =
+        [unpushed, working, untracked].iter().flat_map(|out| out.lines()).map(str::to_string).collect();
     files.sort();
     files.dedup();
-    files
+    Some(files)
 }
 
 /// 这些文件要跑哪些检查，按 `Check::ALL` 的顺序。

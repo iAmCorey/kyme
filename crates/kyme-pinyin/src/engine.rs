@@ -684,11 +684,12 @@ impl Engine {
             None => user.abbr(&initials),
         };
         for &word in learned.iter().filter(|&&word| fits(user.syllables(word))) {
-            let text = user.text(word);
-            // 主词库里也有的词，换成加过分的代价
+            let (text, cost) = (user.text(word), user.cost(word));
+            // 同一个字可能是另一个读音（「的」de 和 di 都对得上简拼 d），留代价低的那个
             match found.iter_mut().find(|(found, _)| self.word_text(user, *found) == text) {
-                Some(slot) => *slot = (Word::User(word), user.cost(word)),
-                None => found.push((Word::User(word), user.cost(word))),
+                Some(slot) if cost < slot.1 => *slot = (Word::User(word), cost),
+                Some(_) => {}
+                None => found.push((Word::User(word), cost)),
             }
         }
         found.sort_by(|a, b| a.1.total_cmp(&b.1));
@@ -797,6 +798,19 @@ mod tests {
         assert_eq!(c.candidates[0].text, "姬", "排第 5 的选了 3 次，升到首位");
         assert_eq!(c.candidates[0].syllables, syllables(&engine, "ji"));
         assert_eq!(c.candidates.len(), 5, "换成用户词，不多出一个");
+    }
+
+    #[test]
+    fn a_rare_reading_does_not_push_out_the_common_one() {
+        let engine = Engine::new(Dictionary::from_rime_sources(&["的\tde\t100000\n的\tdi\t100\n到\tdao\t5000\n"]));
+        let mut user = UserDict::default();
+        user.learn(engine.dictionary(), "的", &syllables(&engine, "di"), 0);
+        assert_eq!(
+            engine.convert_with("d", &user).candidates[0].text,
+            "的",
+            "简拼 d 时留常用的 de，不换成选过一次的 di"
+        );
+        assert_eq!(engine.convert_with("di", &user).candidates[0].text, "的");
     }
 
     #[test]

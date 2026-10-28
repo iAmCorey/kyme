@@ -200,7 +200,13 @@ fn qa(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let checks = options.checks(|| changes::checks(&changes::files(&root)));
+    let checks = options.checks(|| match changes::files(&root) {
+        Some(files) => changes::checks(&files),
+        None => {
+            println!("查不出还没推送哪些改动（没设上游，也比不了 origin/main），全部跑\n");
+            Check::ALL.to_vec()
+        }
+    });
     if checks.is_empty() {
         println!("还没推送的改动里没有要检查的（只改了文档之类），不用跑。全部跑用 --all");
         return ExitCode::SUCCESS;
