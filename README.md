@@ -1,21 +1,21 @@
 # Kyme
 
-开源、AI 原生的中文输入法，先做 macOS。Rust + [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui)。
+开源、AI 原生的中文输入法，首先支持 macOS。Rust + [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui)。
 
 早期版本。路线图见 [docs/PLAN.md](docs/PLAN.md)，引擎设计见 [docs/ENGINE.md](docs/ENGINE.md)，更新记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 功能
 
 - 全拼整句、简拼（`rgzn` → 人工智能）
-- 手误纠错（`zhnog` → 中），打对的拼音不改
-- 拼音显示在输入框里，候选窗一行，每页 5–10 个
-- 候选带 emoji（`haha` → 😄）
-- 记住选过的词：常选的往前排，只存在本机
-- 自定义词库；导入外部词库（搜狗细胞词库、Rime、文本）
-- AI 预测选词（默认关）：停顿时请模型按光标前的文字挑首选，AI 挑的那句标 ✨；可选 TypeSafe、Anthropic、OpenAI、DeepSeek、通义千问、Kimi、智谱、OpenRouter，或自定义接口
+- 手误纠错（`zhnog` → 中），不改动正确输入的拼音
+- 拼音内嵌于输入框；单行候选窗，每页 5–10 个候选
+- Emoji 候选（`haha` → 😄）
+- 选词记忆：常用候选自动前移，数据仅保存在本机
+- 自定义词库；导入外部词库（搜狗细胞词库、Rime、文本）；可在设置中下载雾凇扩展词库和腾讯词库
+- AI 预测选词（默认关闭）：停止输入时由模型结合光标前的文字选出首选，以 ✨ 标记；支持 TypeSafe、Anthropic、OpenAI、DeepSeek、通义千问、Kimi、智谱、OpenRouter 及自定义接口
 - Shift 切换中英
 - 中文标点，引号自动配对
-- 不开 AI 预测选词就不联网；日志不记输入内容
+- 除在设置中下载词库外，未开启 AI 预测选词时不联网；日志不记录输入内容
 
 ## 安装
 
@@ -25,35 +25,35 @@
 scripts/dev-install.sh
 ```
 
-首次安装在系统弹窗里点「允许」，再在菜单栏的输入法里选「Kyme 拼音」。
+首次安装时在系统弹窗中点击「允许」，然后在菜单栏的输入法菜单中选择「Kyme 拼音」。
 
-卸载：在「系统设置 › 键盘」里移除 Kyme 拼音，删掉 `~/Library/Input Methods/Kyme.app`。
+卸载：在「系统设置 › 键盘」中移除 Kyme 拼音，并删除 `~/Library/Input Methods/Kyme.app`。
 
 ## 按键
 
 | 按键 | 作用 |
 |---|---|
 | 空格 | 上屏高亮的候选 |
-| `1`–`9`、`0` | 选对应的候选 |
+| `1`–`9`、`0` | 选择对应的候选 |
 | `-` `=`、↑ ↓、Page Up / Down | 翻页 |
 | ← → | 移动高亮 |
-| 回车 | 上屏字母 |
+| 回车 | 上屏输入的字母 |
 | Esc | 取消输入 |
-| 退格 | 删字母，删光后退回上一次选的字 |
+| 退格 | 删除字母；字母删完后撤销上一次选择的字 |
 | `'` | 分隔音节 |
 | Shift | 切换中 / 英 |
-| 鼠标点候选 | 上屏点的那个；点 ‹ › 翻页 |
+| 鼠标点击候选 | 上屏所点的候选；点击 ‹ › 翻页 |
 
 ## 设置
 
-输入法菜单里选「Kyme 设置…」，或从 Spotlight、启动台打开 Kyme。
+在输入法菜单中选择「Kyme 设置…」，或通过 Spotlight、启动台打开 Kyme。
 
-也可以直接改 `~/Library/Application Support/Kyme/settings.toml`，保存后切换一下输入框生效。自定义词库和导入的外部词库在同目录的 `dicts/` 里。
+也可直接编辑 `~/Library/Application Support/Kyme/settings.toml`，保存后切换输入框即可生效。自定义词库和导入的外部词库位于同目录的 `dicts/` 中。
 
 ## 开发
 
 ```bash
-cargo xtask qa                   # 发版前的整套检查，见 docs/QA.md
+cargo xtask qa                   # 发版前的完整检查，见 docs/QA.md
 scripts/fetch-dict.sh            # 下载词库
 swift scripts/make-icons.swift   # 重新生成图标
 cargo run --release -p kyme-pinyin --example repl -- data/rime-ice/8105.dict.yaml data/rime-ice/base.dict.yaml

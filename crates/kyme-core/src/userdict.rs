@@ -65,10 +65,7 @@ impl UserDictFile {
 
     /// 清除：删掉文件。输入法下次切换输入框时发现文件没了，就清空。
     pub fn clear(&self) -> io::Result<()> {
-        match fs::remove_file(&self.path) {
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-            result => result,
-        }
+        disk::remove(&self.path)
     }
 }
 

@@ -10,6 +10,8 @@ use crate::{Check, util};
 const RULES: &[(&str, &[Check])] = &[
     // 引擎改了，首选和按键场景的结果都可能变；两边用同一个引擎，接入层对照不会因此对不上
     ("crates/kyme-pinyin/", &[Check::Eval, Check::Scenarios]),
+    // 扩展词库登记的校验值由评测核对
+    ("crates/kyme-core/src/extra.rs", &[Check::Eval]),
     ("crates/kyme-core/", &[Check::Scenarios, Check::Macos]),
     ("crates/kyme-ui/", &[Check::Macos]),
     ("crates/kyme-macos/bundle/", &[Check::Bundle]),

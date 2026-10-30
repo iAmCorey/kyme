@@ -105,7 +105,7 @@ fn boot(cx: &mut App, loading: JoinHandle<Engine>, settings: SettingsFile, user_
     let _ = NSApplication::sharedApplication(mtm).setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
     let panel = panel::PanelWindow::open(cx, state::pick);
-    let engine = Arc::new(loading.join().expect("读词库的线程崩溃了"));
+    let engine = Arc::new(loading.join().expect("词库加载线程异常退出"));
     release_memory();
     state::install(state::AppState::new(engine, panel, cx.to_async(), settings, user_data));
 }

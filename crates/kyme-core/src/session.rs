@@ -379,22 +379,22 @@ impl Session {
     /// 不该再动候选；首选用了纠错的话，给 AI 挑的整句（不纠错）就对不上了。不问时返回原因，写日志用，不带打的字。
     pub fn ai_query(&self) -> Result<AiQuery, &'static str> {
         if self.input.is_empty() {
-            return Err("没在输入");
+            return Err("未在输入");
         }
         if self.highlight != 0 {
-            return Err("挪过高亮");
+            return Err("已移动高亮");
         }
         if self.ai.is_some() {
-            return Err("已经标了 ✨");
+            return Err("已标 ✨");
         }
-        let first = self.conversion.candidates.first().ok_or("没有候选")?;
+        let first = self.conversion.candidates.first().ok_or("无候选")?;
         let mut sentences = self.engine.sentences(&self.input, self.learned_words(), AI_SENTENCES);
         // 首选放在第一个，AI 挑它就是不用换
-        let at = sentences.iter().position(|sentence| sentence.text == first.text).ok_or("首选用了纠错")?;
+        let at = sentences.iter().position(|sentence| sentence.text == first.text).ok_or("首选为纠错结果")?;
         let first = sentences.remove(at);
         sentences.insert(0, first);
         if sentences.len() < 2 {
-            return Err("只有一句");
+            return Err("仅有一句");
         }
         Ok(AiQuery { generation: self.generation, selected: self.selected(), pinyin: self.input.clone(), sentences })
     }
@@ -717,7 +717,7 @@ mod tests {
         assert_eq!(panel.ai, Some(0));
         assert_eq!(panel.emoji, Some(panel.candidates.len() - 1), "emoji 还在最后一格");
         assert_eq!(panel.candidates.last().map(String::as_str), Some("🤢"), "按新的首选配 emoji");
-        assert_eq!(s.ai_query().err(), Some("已经标了 ✨"), "放了 ✨ 就不再问");
+        assert_eq!(s.ai_query().err(), Some("已标 ✨"), "放了 ✨ 就不再问");
         assert_eq!(press(&mut s, Key::Space).commit.as_deref(), Some("好难喝"));
     }
 
@@ -731,7 +731,7 @@ mod tests {
         let View::Composing { panel, .. } = s.view() else { panic!("还在输入") };
         assert_eq!(panel.candidates, before.candidates, "候选不动");
         assert_eq!(panel.ai, Some(0));
-        assert_eq!(s.ai_query().err(), Some("已经标了 ✨"), "看过了就不再问");
+        assert_eq!(s.ai_query().err(), Some("已标 ✨"), "看过了就不再问");
         assert_eq!(press(&mut s, Key::Space).commit.as_deref(), Some("好难和"));
     }
 
@@ -753,7 +753,7 @@ mod tests {
         assert!(!s.offer_ai(&query, pick(&query, "好难喝"), Instant::now()), "输入已经变了");
         press(&mut s, Key::Backspace);
         press(&mut s, Key::Right);
-        assert_eq!(s.ai_query().err(), Some("挪过高亮"), "正在挑，就不问了");
+        assert_eq!(s.ai_query().err(), Some("已移动高亮"), "正在挑，就不问了");
     }
 
     #[test]

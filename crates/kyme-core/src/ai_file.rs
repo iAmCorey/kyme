@@ -72,7 +72,7 @@ impl AiFile {
         let result = match fs::read_to_string(&self.path) {
             Ok(text) => toml::from_str(&text).map_err(|err| invalid("ai.toml ", &text, err.span(), err.message())),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(AiServices::default()),
-            Err(err) => Err(format!("读不了 ai.toml：{err}")),
+            Err(err) => Err(format!("无法读取 ai.toml：{err}")),
         };
         Some(result)
     }
@@ -86,13 +86,13 @@ impl AiFile {
                     .map_err(|err| invalid("ai.toml ", &text, err.span(), err.message()))?;
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(format!("读不了 ai.toml：{err}")),
+            Err(err) => return Err(format!("无法读取 ai.toml：{err}")),
         }
         let filled: BTreeMap<&String, &AiService> =
             services.0.iter().filter(|(_, service)| **service != EMPTY).collect();
-        let text = toml::to_string(&filled).map_err(|err| format!("AI 的设置转不成 TOML：{err}"))?;
-        disk::write_atomic(&self.path, &format!("{HEADER}{text}"), true)
-            .map_err(|err| format!("写不了 ai.toml：{err}"))?;
+        let text = toml::to_string(&filled).map_err(|err| format!("AI 设置无法转换为 TOML：{err}"))?;
+        disk::write_atomic(&self.path, format!("{HEADER}{text}"), true)
+            .map_err(|err| format!("无法写入 ai.toml：{err}"))?;
         // 自己写的不算改过，下次 reload 不重读
         self.seen = Some(disk::modified(&self.path));
         Ok(())
@@ -139,7 +139,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         fs::write(file.path(), "[anthropic\n").unwrap();
         let err = file.reload().unwrap().unwrap_err();
-        assert!(err.starts_with("ai.toml 第 1 行写得不对") && !err.contains('\n'), "{err}");
+        assert!(err.starts_with("ai.toml 第 1 行有误") && !err.contains('\n'), "{err}");
         assert!(file.save(&services).is_err(), "写坏了就不写");
         assert_eq!(fs::read_to_string(file.path()).unwrap(), "[anthropic\n", "原样留着");
 

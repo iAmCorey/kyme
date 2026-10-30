@@ -43,7 +43,7 @@ pub struct Dictionary {
     /// 判断「有没有以这几个音节开头的词」时要一起查，不然它们会在切分时被提前剪掉。
     long_prefixes: Vec<u64>,
     ln_total: f64,
-    /// 按文字查词条：全部词条按文字排序，同一个写法只留最常用的读音。给没写拼音的本地词补读音用，
+    /// 按文字查词条的表（见 `find_text`），同一个写法只留最常用的读音。给没写拼音的词补读音用，
     /// 第一次用到时才建。
     by_text: OnceLock<Vec<u32>>,
 }
@@ -168,6 +168,14 @@ pub(crate) fn abbr_prefix(initials: &[u8]) -> Option<(u64, u64)> {
     abbr_key_of(initials).map(|key| prefix_range(key, initials.len(), ABBR_BITS, ABBR_SLOTS))
 }
 
+/// `find_text` 的表里的空格。
+const NO_ENTRY: u32 = u32::MAX;
+
+/// 文字的哈希值（FNV-1a），`find_text` 的表用。
+fn text_hash(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3))
+}
+
 /// 一套有序索引：key 和词的下标两列平行，按 key 排序。查某个 key 下的词、判断有没有以某串开头的 key，
 /// 都是二分查找。主词库的简拼索引和用户词库都用它。
 pub(crate) struct KeyIndex {
@@ -236,11 +244,16 @@ impl Builder {
 
     /// 排序、建索引。`ln_total` 是 None 时按这些词自己的总词频算代价。
     fn build(self, table: SyllableTable, ln_total: Option<f64>) -> Dictionary {
-        let Builder { texts, syls, mut entries } = self;
+        let Builder { mut texts, mut syls, mut entries } = self;
+        // 攒词条时按倍数长大，空着的那截一直占着内存：主词库五十多万个词，要多占好几 MB
+        texts.shrink_to_fit();
+        syls.shrink_to_fit();
+        entries.shrink_to_fit();
         let ids_of = |e: &Entry| &syls[e.syl_off as usize..][..usize::from(e.syl_len)];
         let exact_key_of = |e: &Entry| exact_key(ids_of(e)).unwrap_or(u64::MAX);
-        // 稳定排序：同 key 同词频时保持读入顺序
-        entries.sort_by_cached_key(|e| (exact_key_of(e), Reverse(e.weight)));
+        // 同 key 同词频时保持读入顺序（文字在 texts 里的位置是递增的）。不用 sort_by_cached_key：
+        // 它要另外分配一块存 key，近百万个词就是二十多 MB，释放了也不一定还给系统
+        entries.sort_unstable_by_key(|e| (exact_key_of(e), Reverse(e.weight), e.text_off));
         let exact_keys: Vec<u64> = entries.iter().map(exact_key_of).collect();
 
         let mut abbr: Vec<(u64, Reverse<u32>, u32)> = entries
@@ -339,17 +352,45 @@ impl Dictionary {
     }
 
     /// 文字是 `text` 的词条，同一个写法有几个读音的（「行」xing、hang）取最常用的。
-    /// 第一次调用时建索引（主词库约 0.1 秒、2 MB），之后一直留着。
+    /// 第一次调用时建一张按文字的哈希值开放寻址的表（主词库约 4 MB），之后一直留着。查起来比二分查找快得多：
+    /// 腾讯词库近百万个词补读音，二分查找要 5 秒，查表 1 秒多。
     pub(crate) fn find_text(&self, text: &str) -> Option<u32> {
-        let index = self.by_text.get_or_init(|| {
-            let weight = |entry: u32| self.entries[entry as usize].weight;
-            let mut index: Vec<u32> = (0..self.entries.len() as u32).collect();
-            index.sort_unstable_by(|&a, &b| self.text(a).cmp(self.text(b)).then(weight(b).cmp(&weight(a))));
-            // 同一个写法只留排在最前、也就是最常用的那个
-            index.dedup_by(|later, kept| self.text(*later) == self.text(*kept));
-            index
-        });
-        index.binary_search_by(|&entry| self.text(entry).cmp(text)).ok().map(|at| index[at])
+        let table = self.by_text.get_or_init(|| self.text_table());
+        let mask = table.len() - 1;
+        let mut at = text_hash(text) as usize & mask;
+        loop {
+            match table[at] {
+                NO_ENTRY => return None,
+                entry if self.text(entry) == text => return Some(entry),
+                _ => at = (at + 1) & mask,
+            }
+        }
+    }
+
+    /// `find_text` 用的表：每个写法一格，放最常用的那个词条，空格是 `NO_ENTRY`。格数是 2 的幂，至少空着四分之一。
+    fn text_table(&self) -> Vec<u32> {
+        let mask = (self.entries.len() * 4 / 3 + 1).next_power_of_two() - 1;
+        let mut table = vec![NO_ENTRY; mask + 1];
+        for entry in 0..self.entries.len() as u32 {
+            let text = self.text(entry);
+            let mut at = text_hash(text) as usize & mask;
+            loop {
+                match table[at] {
+                    NO_ENTRY => table[at] = entry,
+                    other if self.text(other) == text => {
+                        if self.weight(entry) > self.weight(other) {
+                            table[at] = entry;
+                        }
+                    }
+                    _ => {
+                        at = (at + 1) & mask;
+                        continue;
+                    }
+                }
+                break;
+            }
+        }
+        table
     }
 
     /// 读音为 `ids`、文字为 `text` 的词条。

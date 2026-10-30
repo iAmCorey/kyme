@@ -6,6 +6,12 @@
 //! - Anthropic 的 Claude，和 OpenAI 兼容的接口（OpenAI、DeepSeek、通义千问、Kimi、智谱、OpenRouter，还有自定义的）：
 //!   聊天模型。把整句编上号，让它只回编号，拿不准时回 1，也就是引擎的首选。它们不给把握度：有前文时照用它挑的，
 //!   没有前文时不拿它换首选（见 [`Pick::trusted`]）。
+//!
+//! 设置窗口里下载扩展词库也在这里（[`download`]）：Kyme 只有这个 crate 联网。
+
+mod download;
+
+pub use download::download;
 
 use std::fmt;
 use std::sync::Mutex;
@@ -348,7 +354,7 @@ fn anthropic_request(model: &str, fallback: bool, context: &str, pinyin: &str, c
 /// TypeSafe 的回复：挑中的选项和把握度。挑了候选以外的东西算出错。
 fn parse_typesafe(reply: &Value, candidates: &[&str]) -> Result<Pick, String> {
     let answer = &reply["answers"][QUESTION];
-    let chosen = answer["choice"].as_str().ok_or("返回结果里没有选项")?;
+    let chosen = answer["choice"].as_str().ok_or("返回结果中没有选项")?;
     let index = candidates.iter().position(|text| *text == chosen).ok_or("返回的选项不在候选中")?;
     Ok(Pick {
         index,
@@ -391,7 +397,7 @@ fn parse_anthropic(reply: &Value, count: usize) -> Result<Pick, String> {
 /// 聊天模型回的编号（从 1 起），换成下标。取回复里的第一个数。
 fn chosen_number(text: &str, count: usize) -> Result<usize, String> {
     let digits: String = text.chars().skip_while(|c| !c.is_ascii_digit()).take_while(char::is_ascii_digit).collect();
-    let number: usize = digits.parse().map_err(|_| "返回结果里没有编号".to_string())?;
+    let number: usize = digits.parse().map_err(|_| "返回结果中没有编号".to_string())?;
     (1..=count).contains(&number).then(|| number - 1).ok_or_else(|| format!("返回的编号 {number} 超出范围"))
 }
 

@@ -1,11 +1,13 @@
 //! 设置窗口：左边是导航栏，右边是一页设置。「输入」「外观」两页上面是候选窗的预览；「自定义词库」加词、删词
-//! （custom.rs）；「外部词库」导入别家的词库；「AI」选服务商、填 Key。点一下就写进设置文件，文件里的注释照旧；
+//! （custom.rs）；「外部词库」下载、载入扩展词库，导入别家的词库；「AI」选服务商、填 Key。点一下就写进设置文件，文件里的注释照旧；
 //! AI 的 Key、模型和地址写进旁边只有自己能读写的 ai.toml。输入法切换输入框时读到新设置。
 
 mod custom;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
@@ -15,8 +17,8 @@ use gpui::{
 };
 use kyme_core::pinyin::{Dictionary, Emoji, Engine};
 use kyme_core::{
-    AiFile, AiProvider, AiService, AiServices, FONT_SIZES, Imported, Key, LocalDicts, Modifiers, PAGE_SIZES, Rgb,
-    Session, Settings, SettingsFile, UserDictFile, View,
+    AI_PAUSES, AiFile, AiProvider, AiService, AiServices, EXTRA_DICTS, ExtraDir, FONT_SIZES, Imported, Key, LocalDicts,
+    Modifiers, PAGE_SIZES, Rgb, Session, Settings, SettingsFile, UserDictFile, View,
 };
 
 use self::custom::CustomWordsView;
@@ -51,7 +53,7 @@ const PREVIEW_DICT: &str = "你好\tni hao\t1000\n你\tni\t900\n拟\tni\t800\n�
                             妮\tni\t500\n倪\tni\t400\n霓\tni\t300\n逆\tni\t200\n腻\tni\t100\n";
 const PREVIEW_EMOJI: &str = "你好\t你好 👋\n";
 
-/// 「检查一下」问的例子：看前文是「美食」，引擎的首选是「没事」。例子是定死的，不发打过的字。
+/// 「测试连接」问的例子：看前文是「美食」，引擎的首选是「没事」。例子是定死的，不发打过的字。
 const CHECK_CONTEXT: &str = "周末想去夜市吃点";
 const CHECK_PINYIN: &str = "meishi";
 const CHECK_CANDIDATES: [&str; 3] = ["没事", "美食", "美式"];
@@ -120,7 +122,7 @@ enum Menu {
     Model,
 }
 
-/// 「检查一下」的进度。在查的那一次记着编号，回来的结果对得上才算数。
+/// 「测试连接」的进度。在查的那一次记着编号，回来的结果对得上才算数。
 enum Check {
     Running(u64),
     Done(Result<(), String>),
@@ -133,6 +135,28 @@ enum Confirm {
     Clear,
     /// 删掉这个导入的外部词库。
     Remove(String),
+    /// 删掉下载的这个扩展词库（`EXTRA_DICTS` 里的下标）。
+    RemoveExtra(usize),
+}
+
+/// 正在下载的扩展词库和进度：后台线程边下边写，界面每隔一会儿读一次。
+struct Download {
+    /// `EXTRA_DICTS` 里的下标。
+    dict: usize,
+    done: AtomicU64,
+    /// 总共多少字节，服务器没说是 0。
+    total: AtomicU64,
+}
+
+impl Download {
+    /// 「正在下载 45%」，不知道总共多少时显示下了几 MB。
+    fn label(&self) -> String {
+        let (done, total) = (self.done.load(Ordering::Relaxed), self.total.load(Ordering::Relaxed));
+        match total {
+            0 => format!("正在下载 {:.1}MB", done as f64 / 1e6),
+            total => format!("正在下载 {}%", done * 100 / total),
+        }
+    }
 }
 
 pub struct SettingsView {
@@ -154,7 +178,7 @@ pub struct SettingsView {
     page: Page,
     /// 用户词库里有几个词。
     learned_words: usize,
-    /// 点过一次、等着再点一次的操作。
+    /// 点过一次、等着确认的操作。
     confirm: Option<Confirm>,
     /// 安装包里的词库目录，自定义词库页定读音用。
     dict_dir: Option<PathBuf>,
@@ -164,6 +188,8 @@ pub struct SettingsView {
     imported: Vec<Imported>,
     /// 正在导入，先不让再点。
     importing: bool,
+    /// 正在下载的扩展词库，一次只下一个。
+    download: Option<Arc<Download>>,
     ai_file: AiFile,
     ai_services: AiServices,
     /// 「AI」页的输入框里正显示着哪一家的设置。
@@ -174,9 +200,9 @@ pub struct SettingsView {
     menu: Option<Menu>,
     /// 模型选了「其他…」，自己填模型名。
     other_model: bool,
-    /// 「检查一下」的进度和结果。
+    /// 「测试连接」的进度和结果。
     ai_check: Option<Check>,
-    /// 点了几次「检查一下」，给每一次编号。
+    /// 点了几次「测试连接」，给每一次编号。
     checks: u64,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -248,6 +274,7 @@ impl SettingsView {
             custom: None,
             imported: Vec::new(),
             importing: false,
+            download: None,
             ai_services: AiServices::default(),
             ai_shown: None,
             ai_fields,
@@ -391,11 +418,16 @@ impl SettingsView {
         UserDictFile::beside(self.file.path())
     }
 
-    /// 「记住选过的词」一行的右边：学了几个词、清除，和开关。清除要点两次，免得手滑。
+    /// 下载的扩展词库存在哪。
+    fn extra(&self) -> ExtraDir {
+        ExtraDir::beside(self.file.path())
+    }
+
+    /// 「选词记忆」一行的右边：学了几个词、清除，和开关。清除要点两次，免得手滑。
     fn learn_control(&self, p: &Palette, cx: &mut Context<Self>) -> Div {
         let clear = (self.learned_words > 0).then(|| {
             let label = format!("{} 个词 · 清除", self.learned_words);
-            confirm_link(p, "clear-learned", label, "再点一次清除", self.confirm == Some(Confirm::Clear))
+            confirm_link(p, "clear-learned", label, "确认清除", self.confirm == Some(Confirm::Clear))
                 .on_click(cx.listener(|view, _: &ClickEvent, _, cx| view.clear_learned(cx)))
         });
         div().flex().items_center().gap(px(12.0)).children(clear).child(
@@ -408,7 +440,7 @@ impl SettingsView {
         if self.confirmed(Confirm::Clear) {
             match self.userdict().clear() {
                 Ok(()) => self.learned_words = 0,
-                Err(err) => self.error = Some(format!("清除不了学到的词：{err}")),
+                Err(err) => self.error = Some(format!("无法清除选词记忆：{err}")),
             }
         }
         cx.notify();
@@ -481,16 +513,101 @@ impl SettingsView {
         .detach();
     }
 
+    /// 扩展词库那一行的右边：没下载是「下载」，下载中显示进度，下载了是删除和开关。删除要点两次，免得手滑。
+    fn extra_control(&self, i: usize, p: &Palette, cx: &mut Context<Self>) -> Div {
+        let dict = &EXTRA_DICTS[i];
+        let control = div().flex().items_center().gap(px(12.0));
+        if let Some(download) = &self.download
+            && download.dict == i
+        {
+            return control.child(note(p, download.label()));
+        }
+        if !self.extra().has(dict) {
+            // 一次只下一个，别的先等着
+            let download = match self.download {
+                Some(_) => link(("download", i), "下载", p.theme.secondary),
+                None => link(("download", i), "下载", p.theme.accent)
+                    .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| view.download(i, cx))),
+            };
+            return control.child(download);
+        }
+        let confirming = self.confirm == Some(Confirm::RemoveExtra(i));
+        let remove = confirm_link(p, ("remove-extra", i), "删除".into(), "确认删除", confirming)
+            .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| view.remove_extra(i, cx)));
+        let on = (dict.enabled)(&self.settings.dicts);
+        let toggle =
+            switch(p, dict.file(), on).on_click(on_change(cx, move |s| (EXTRA_DICTS[i].set)(&mut s.dicts, !on)));
+        control.child(remove).child(toggle)
+    }
+
+    /// 下载第 `i` 个扩展词库：在后台下好、核对、存起来，然后打开它的开关。下载中每 0.2 秒刷新一次进度。
+    fn download(&mut self, i: usize, cx: &mut Context<Self>) {
+        if self.download.is_some() {
+            return;
+        }
+        let download = Arc::new(Download { dict: i, done: AtomicU64::new(0), total: AtomicU64::new(0) });
+        self.download = Some(download.clone());
+        self.error = None;
+        cx.notify();
+        let extra = self.extra();
+        cx.spawn(async move |view, cx| {
+            // 下载期间每 0.2 秒刷新一次进度，下完把这个任务丢掉就停了
+            let refresh = cx.spawn({
+                let view = view.clone();
+                async move |cx| {
+                    while view.update(cx, |_, cx| cx.notify()).is_ok() {
+                        cx.background_executor().timer(Duration::from_millis(200)).await;
+                    }
+                }
+            });
+            let dict = &EXTRA_DICTS[i];
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    kyme_ai::download(&dict.urls(), |done, total| {
+                        download.done.store(done, Ordering::Relaxed);
+                        download.total.store(total.unwrap_or(0), Ordering::Relaxed);
+                    })
+                    .and_then(|bytes| extra.save(dict, &bytes))
+                })
+                .await;
+            drop(refresh);
+            let _ = view.update(cx, |view, cx| {
+                view.download = None;
+                match result {
+                    Ok(()) => view.change(&|s: &mut Settings| (dict.set)(&mut s.dicts, true), cx),
+                    Err(err) => {
+                        view.error = Some(format!("「{}」下载失败：{err}", dict.name));
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 删掉下载的扩展词库，同时关掉它的开关：输入法下次切换输入框时就不再载入。
+    fn remove_extra(&mut self, i: usize, cx: &mut Context<Self>) {
+        if self.confirmed(Confirm::RemoveExtra(i)) {
+            let dict = &EXTRA_DICTS[i];
+            match self.extra().remove(dict) {
+                Ok(()) => return self.change(&|s: &mut Settings| (dict.set)(&mut s.dicts, false), cx),
+                Err(err) => self.error = Some(format!("无法删除「{}」：{err}", dict.name)),
+            }
+        }
+        cx.notify();
+    }
+
     /// 一个导入的词库那一行的右边：有几个词、删除。删除要点两次，免得手滑。
     fn remove_control(&self, dict: &Imported, p: &Palette, cx: &mut Context<Self>) -> Div {
         let name = dict.name.clone();
         let confirming = self.confirm == Some(Confirm::Remove(name.clone()));
         let id = ElementId::Name(format!("remove-{name}").into());
-        let remove = confirm_link(p, id, "删除".into(), "再点一次删除", confirming).on_click(cx.listener(
+        let remove = confirm_link(p, id, "删除".into(), "确认删除", confirming).on_click(cx.listener(
             move |view, _: &ClickEvent, _, cx| {
                 if view.confirmed(Confirm::Remove(name.clone())) {
                     if let Err(err) = view.dicts.remove(&name) {
-                        view.error = Some(format!("删不了「{name}」：{err}"));
+                        view.error = Some(format!("无法删除「{name}」：{err}"));
                     }
                     view.reload(cx);
                 } else {
@@ -507,9 +624,9 @@ impl SettingsView {
         let preset = kyme_ai::preset(provider);
         self.other_model = !service.model.is_empty() && !preset.models.contains(&service.model.as_str());
         let placeholder = |field| match field {
-            AiField::Model => "模型名",
+            AiField::Model => "模型名称",
             AiField::Endpoint => "http://localhost:11434/v1",
-            AiField::Key if preset.key_optional() => "可以不填",
+            AiField::Key if preset.key_optional() => "选填",
             AiField::Key => "",
         };
         for (field, entity) in AiField::ALL.into_iter().zip(&self.ai_fields) {
@@ -604,6 +721,16 @@ impl SettingsView {
             segment(p, ("page-size", n), selected)
                 .child(n.to_string())
                 .when(!selected, |segment| segment.on_click(on_change(cx, move |s| s.input.page_size = n)))
+        }))
+    }
+
+    fn pause_picker(&self, p: &Palette, cx: &mut Context<Self>) -> Div {
+        let current = self.settings.ai.pause_ms;
+        segmented(p).children(AI_PAUSES.map(|ms| {
+            let selected = ms == current;
+            segment(p, ("ai-pause", ms as usize), selected)
+                .child(format!("{} 秒", ms as f64 / 1000.0))
+                .when(!selected, |segment| segment.on_click(on_change(cx, move |s| s.ai.pause_ms = ms)))
         }))
     }
 
@@ -845,21 +972,21 @@ impl SettingsView {
     fn input_page(&self, p: &Palette, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let input = &self.settings.input;
         let rows = [
-            row(p, true, "每页候选", self.page_picker(p, cx)),
+            row(p, true, "每页候选数", self.page_picker(p, cx)),
             row(
                 p,
                 false,
-                "拼音显示在输入框里",
+                "输入框内显示拼音",
                 switch(p, "inline", input.inline_pinyin)
                     .on_click(on_change(cx, |s| s.input.inline_pinyin = !s.input.inline_pinyin)),
             ),
             row(
                 p,
                 false,
-                "候选带 emoji",
+                "显示 Emoji 候选",
                 switch(p, "emoji", input.emoji).on_click(on_change(cx, |s| s.input.emoji = !s.input.emoji)),
             ),
-            row(p, false, "记住选过的词", self.learn_control(p, cx)),
+            row(p, false, "选词记忆", self.learn_control(p, cx)),
         ];
         scrolling(Page::Input, [self.stage(p, window, cx), card(p).children(rows)])
     }
@@ -874,6 +1001,12 @@ impl SettingsView {
     }
 
     fn imported_page(&self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let extra = card(p).children(
+            EXTRA_DICTS
+                .iter()
+                .enumerate()
+                .map(|(i, dict)| row(p, i == 0, described(p, dict.name, dict.detail), self.extra_control(i, p, cx))),
+        );
         let import = card(p).child(row(
             p,
             true,
@@ -887,18 +1020,20 @@ impl SettingsView {
             .map(|(i, dict)| row(p, i == 0, dict.name.clone(), self.remove_control(dict, p, cx)))
             .collect();
         let list =
-            if listed.is_empty() { note(p, "还没有导入过词库").px(px(4.0)) } else { card(p).children(listed) };
-        scrolling(Page::Imported, [import, list])
+            if listed.is_empty() { note(p, "暂无导入的词库").px(px(4.0)) } else { card(p).children(listed) };
+        scrolling(Page::Imported, [extra, import, list])
     }
 
     fn ai_page(&self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let ai = &self.settings.ai;
-        let toggle = card(p).child(row(
-            p,
-            true,
-            "AI 预测选词",
-            switch(p, "ai", ai.enabled).on_click(on_change(cx, |s| s.ai.enabled = !s.ai.enabled)),
-        ));
+        let toggle = card(p)
+            .child(row(
+                p,
+                true,
+                "AI 预测选词",
+                switch(p, "ai", ai.enabled).on_click(on_change(cx, |s| s.ai.enabled = !s.ai.enabled)),
+            ))
+            .child(row(p, false, "预测延迟", self.pause_picker(p, cx)));
         let provider = ai.provider;
         let providers = AiProvider::ALL.map(|option| (option.name().into(), option == provider)).to_vec();
         let field = |field: AiField| div().w(px(FIELD_WIDTH)).child(self.ai_fields[field as usize].clone());
@@ -917,7 +1052,7 @@ impl SettingsView {
                 rows.push(row(p, false, "接口地址", note(p, endpoint)));
                 rows.push(row(p, false, "模型", self.dropdown(p, Menu::Model, options, cx)));
                 if self.other_model {
-                    rows.push(row(p, false, "模型名", field(AiField::Model)));
+                    rows.push(row(p, false, "模型名称", field(AiField::Model)));
                 }
             }
             // 自定义：地址和模型都自己填
@@ -928,7 +1063,7 @@ impl SettingsView {
         }
         rows.push(row(p, false, "API Key", field(AiField::Key)));
         let result = self.ai_check.as_ref().map(|check| match check {
-            Check::Running(_) => note(p, "检查中…"),
+            Check::Running(_) => note(p, "正在测试…"),
             Check::Done(Ok(())) => note(p, "✓ 通过").text_color(p.success),
             Check::Done(Err(err)) => note(p, err.clone()).text_color(p.error),
         });
@@ -938,7 +1073,7 @@ impl SettingsView {
             .flex_col()
             .gap(px(4.0))
             .child(
-                link("check-ai", "检查一下", p.theme.accent)
+                link("check-ai", "测试连接", p.theme.accent)
                     .on_click(cx.listener(|view, _: &ClickEvent, _, cx| view.check_ai(cx))),
             )
             .children(result);
@@ -1033,7 +1168,7 @@ fn note(p: &Palette, text: impl Into<SharedString>) -> Div {
     div().text_size(px(12.0)).text_color(p.theme.secondary).child(text.into())
 }
 
-/// 要点两次的链接：点过一次后变成红字的「再点一次……」。
+/// 要点两次的链接：点过一次后变成红字的「确认……」。
 fn confirm_link(
     p: &Palette,
     id: impl Into<ElementId>,

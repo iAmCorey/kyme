@@ -130,7 +130,7 @@ fn serve(settings: PathBuf) {
     for line in io::stdin().lock().lines().map_while(Result::ok) {
         let reply = match serde_json::from_str::<Request>(&line) {
             Ok(request) => on_main(move |mtm| execute(mtm, request)),
-            Err(err) => Err(format!("看不懂的指令 {line}：{err}")),
+            Err(err) => Err(format!("无法识别的指令 {line}：{err}")),
         };
         let line = serde_json::to_string(&reply).unwrap_or_default();
         if writeln!(stdout, "{line}").and_then(|()| stdout.flush()).is_err() {

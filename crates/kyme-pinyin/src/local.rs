@@ -25,7 +25,7 @@ pub struct Row<'a> {
 }
 
 /// 读一行，认这几种写法：
-/// - Rime 的 `词<Tab>拼音<Tab>词频`，音节用空格隔开，后两列可以不写；
+/// - Rime 的 `词<Tab>拼音<Tab>词频`，音节用空格隔开，后两列可以不写；只有两列、第二列是数字的是 `词<Tab>词频`；
 /// - 用空格隔开的「词 拼音」「拼音 词 词频」、搜狗导出的 `'pin'yin 词`：带汉字的一项是词，纯数字是词频，
 ///   其余是拼音，音节用空格或 `'` 隔开。
 ///
@@ -38,8 +38,12 @@ pub fn parse_line(line: &str) -> Option<Row<'_>> {
     if line.contains('\t') {
         let mut cols = line.split('\t');
         let text = cols.next()?.trim();
-        let pinyin = syllables(cols.next().unwrap_or("")).collect();
-        let weight = cols.next().and_then(weight);
+        let second = cols.next().unwrap_or("");
+        // 只有两列、第二列是数字的，第二列是词频（雾凇的腾讯词库）
+        let (pinyin, weight) = match (weight(second), cols.next()) {
+            (Some(weight), None) => (Vec::new(), Some(weight)),
+            (_, third) => (syllables(second).collect(), third.and_then(weight)),
+        };
         return (!text.is_empty()).then_some(Row { text, pinyin, weight });
     }
     let mut row = Row { text: "", pinyin: Vec::new(), weight: None };
@@ -180,6 +184,7 @@ mod tests {
         let row = |text, pinyin: &[&'static str], weight| Some(Row { text, pinyin: pinyin.to_vec(), weight });
         assert_eq!(parse_line("鲲鹏\tkun peng\t100"), row("鲲鹏", &["kun", "peng"], Some(100)), "Rime");
         assert_eq!(parse_line("鲲鹏\tkun peng"), row("鲲鹏", &["kun", "peng"], None));
+        assert_eq!(parse_line("鲲鹏\t100"), row("鲲鹏", &[], Some(100)), "腾讯词库只写词和词频");
         assert_eq!(parse_line("鲲鹏"), row("鲲鹏", &[], None), "只写词");
         assert_eq!(parse_line("'kun'peng 鲲鹏"), row("鲲鹏", &["kun", "peng"], None), "搜狗导出的");
         assert_eq!(parse_line("kun'peng 鲲鹏 1"), row("鲲鹏", &["kun", "peng"], Some(1)), "QQ 导出的");

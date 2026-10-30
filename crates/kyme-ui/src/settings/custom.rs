@@ -33,7 +33,7 @@ pub(super) struct CustomWordsView {
 impl CustomWordsView {
     /// 词由调用方接着 `reload` 读进来。
     pub(super) fn new(dicts: LocalDicts, dict_dir: Option<PathBuf>, accent: Rgb, cx: &mut Context<Self>) -> Self {
-        let word = cx.new(|cx| TextField::new("加个词，比如：曾小贤 zengxiaoxian", cx));
+        let word = cx.new(|cx| TextField::new("输入词条，可附拼音，如：曾小贤 zengxiaoxian", cx));
         if let Some(dir) = dict_dir {
             cx.spawn(async move |view, cx| {
                 let engine = cx.background_executor().spawn(async move { Engine::load_dir(&dir).ok() }).await;
@@ -101,7 +101,7 @@ impl CustomWordsView {
     }
 
     fn remove(&mut self, word: &LocalWord, cx: &mut Context<Self>) {
-        self.error = self.dicts.remove_custom(word).err().map(|err| format!("删不了「{}」：{err}", word.text));
+        self.error = self.dicts.remove_custom(word).err().map(|err| format!("无法删除「{}」：{err}", word.text));
         self.reload(cx);
     }
 
@@ -110,7 +110,7 @@ impl CustomWordsView {
         let word = &self.words[index];
         let (reading, color): (String, Hsla) = match self.readings.get(index) {
             Some(Some(reading)) => (reading.clone(), p.theme.secondary),
-            Some(None) => ("读不出来".into(), p.error),
+            Some(None) => ("无法识别读音".into(), p.error),
             // 主词库还没读好：写了拼音的先照写的显示
             None => (word.pinyin.clone(), p.theme.secondary),
         };
@@ -140,16 +140,16 @@ impl Render for CustomWordsView {
             .map(|index| self.word_row(&p, index, index + 1 == self.words.len(), cx))
             .collect();
         let list = if rows.is_empty() {
-            card(&p).flex_1().items_center().justify_center().child(note(&p, "还没有加过词"))
+            card(&p).flex_1().items_center().justify_center().child(note(&p, "暂无词条"))
         } else {
             card(&p).flex_1().min_h(px(0.0)).child(div().id("words").size_full().overflow_y_scroll().children(rows))
         };
         // 文件还不在就先建一份带说明的
-        let open = link("open-custom", "用文本编辑器打开", p.theme.accent).on_click(cx.listener(
+        let open = link("open-custom", "在文本编辑器中打开", p.theme.accent).on_click(cx.listener(
             |view, _: &ClickEvent, _, cx| match view.dicts.custom() {
                 Ok(path) => open_text(path, cx),
                 Err(err) => {
-                    view.error = Some(format!("建不了自定义词库的文件：{err}"));
+                    view.error = Some(err);
                     cx.notify();
                 }
             },

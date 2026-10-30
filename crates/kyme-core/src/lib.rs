@@ -6,6 +6,7 @@
 mod ai_file;
 mod dicts;
 mod disk;
+mod extra;
 mod import;
 mod punct;
 mod session;
@@ -14,10 +15,11 @@ mod userdict;
 
 pub use ai_file::{AiFile, AiService, AiServices};
 pub use dicts::{Imported, LocalDicts, LocalWord, read_sources};
+pub use extra::{EXTRA_DICTS, ExtraDict, ExtraDir, RIME_ICE_COMMIT};
 pub use kyme_pinyin as pinyin;
 pub use session::{AiQuery, Key, Mode, Modifiers, Panel, Pick, Response, SELECT_KEYS, Session, View};
 pub use settings::{
-    AiProvider, AiSettings, AppearanceSettings, FONT_SIZES, InputSettings, PAGE_SIZES, Rgb, SETTINGS_TEMPLATE,
-    Settings, SettingsFile,
+    AI_PAUSES, AiProvider, AiSettings, AppearanceSettings, DictSettings, FONT_SIZES, InputSettings, PAGE_SIZES, Rgb,
+    SETTINGS_TEMPLATE, Settings, SettingsFile,
 };
 pub use userdict::{UserDictFile, today};

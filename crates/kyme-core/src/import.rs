@@ -14,7 +14,7 @@ pub fn words(data: &[u8]) -> Result<Vec<LocalWord>, String> {
     let mut words = match scel(data) {
         Some(words) => words,
         None => {
-            let text = decode(data).ok_or("不是搜狗细胞词库，也不是 UTF-8 或 UTF-16 的文本")?;
+            let text = decode(data).ok_or("不支持的文件格式：须为搜狗细胞词库，或 UTF-8、UTF-16 编码的文本")?;
             local::rows(&text).map(LocalWord::from).collect()
         }
     };
@@ -26,7 +26,7 @@ pub fn words(data: &[u8]) -> Result<Vec<LocalWord>, String> {
     let mut keep = keep.into_iter();
     words.retain(|_| keep.next().unwrap_or(false));
     if words.is_empty() {
-        return Err("里面没有认得出的词".into());
+        return Err("未识别到任何词条".into());
     }
     Ok(words)
 }

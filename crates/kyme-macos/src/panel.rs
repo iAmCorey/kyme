@@ -47,7 +47,7 @@ impl PanelWindow {
             .open_window(options, |_, cx| cx.new(|_| CandidateView::new(DEFAULT_FONT, on_pick)))
             .expect("创建候选窗失败");
         let window =
-            handle.update(cx, |_, window, _| ns_window(window)).ok().flatten().expect("拿不到候选窗的 NSWindow");
+            handle.update(cx, |_, window, _| ns_window(window)).ok().flatten().expect("无法获取候选窗的 NSWindow");
 
         // GPUI 的 PopUp 是带标题栏样式的面板，改成无边框；NonactivatingPanel 让点它时不激活本进程
         window.setStyleMask(NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel);

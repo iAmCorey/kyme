@@ -1,15 +1,18 @@
 //! 输入法进程的全局状态。IMK 回调和 GPUI 都跑在主线程，状态放在 thread_local 里。
 
 use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
+use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use core_graphics::event::KeyCode;
 use gpui::{AsyncApp, Task};
-use kyme_core::pinyin::Engine;
+use kyme_core::pinyin::{Dictionary, Engine};
 use kyme_core::{
-    AiFile, AiProvider, AiQuery, AiService, AiServices, Key, LocalDicts, Mode, Modifiers, Panel, Pick, Response,
-    Session, Settings, SettingsFile, UserDictFile, View, read_sources, today,
+    AiFile, AiProvider, AiQuery, AiService, AiServices, ExtraDir, Key, LocalDicts, Mode, Modifiers, Panel, Pick,
+    Response, Session, Settings, SettingsFile, UserDictFile, View, read_sources, today,
 };
 use kyme_ui::Content;
 use objc2::Message;
@@ -27,8 +30,6 @@ const HINT_DURATION: Duration = Duration::from_millis(1500);
 const SLOW_KEY: Duration = Duration::from_millis(100);
 /// 学到新词后停这么久再存盘，打字时不反复写文件。
 const SAVE_DELAY: Duration = Duration::from_secs(10);
-/// 打字停下来这么久才问 AI：一直在打的时候不问，免得白发请求。问出去以后又打了字，回来的答案就扔掉。
-const AI_PAUSE: Duration = Duration::from_millis(100);
 /// 光标前最多读这么多字当前文。
 const CONTEXT_CHARS: usize = 64;
 /// 小键盘上的回车，core-graphics 没有这个常量。
@@ -42,6 +43,22 @@ thread_local! {
     static STATE: RefCell<Option<AppState>> = const { RefCell::new(None) };
 }
 
+/// 主词库旁边附加的一层词库从哪来：本地词库（自定义的和导入的合成一层），或者一个扩展词库文件。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum Source {
+    Local,
+    Extra(&'static str),
+}
+
+impl fmt::Display for Source {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Source::Local => f.write_str("本地词库"),
+            Source::Extra(file) => write!(f, "扩展词库 {file} "),
+        }
+    }
+}
+
 pub struct AppState {
     session: Session,
     panel: PanelWindow,
@@ -53,8 +70,14 @@ pub struct AppState {
     unsaved: bool,
     /// 本地词库的目录。自测模式不读。
     dicts: Option<LocalDicts>,
-    /// 每次开始重建本地词库加一。建好时对不上，说明这期间又改过、又开始了一次，这次的作废。
-    dicts_generation: u64,
+    /// 下载的扩展词库存在哪。自测模式不读。
+    extra: Option<ExtraDir>,
+    /// 主词库旁边附加的几层词库，按来源存着。哪层建好了、卸掉了，就照这里重新拼到引擎上。
+    layers: BTreeMap<Source, Arc<Dictionary>>,
+    /// 每层最近一次开始建的编号。建好时对不上，说明这期间又改过、又开始了一次，这次的作废。
+    building: HashMap<Source, u64>,
+    /// 开始建的次数，给每次编号。
+    builds: u64,
     /// 最近一次按键所在的输入框。鼠标点候选窗时往这里上屏。
     client: Option<Retained<AnyObject>>,
     /// 客户端输入框里当前的 marked text，没变就不重复同步。
@@ -110,6 +133,7 @@ pub fn handle_event(event: &NSEvent, client: &AnyObject) -> bool {
 pub fn activate() {
     with_state((), |state| {
         state.reload_settings();
+        state.reload_extra_dicts();
         state.reload_user_words();
         state.reload_local_dicts();
         state.load_ai();
@@ -156,6 +180,7 @@ impl AppState {
         let userdict = user_data.then(|| UserDictFile::beside(settings.path()));
         let ai_file = AiFile::beside(settings.path());
         let dicts = user_data.then(|| LocalDicts::beside(settings.path()));
+        let extra = user_data.then(|| ExtraDir::beside(settings.path()));
         let mut state = AppState {
             session: Session::new(engine),
             panel,
@@ -164,7 +189,10 @@ impl AppState {
             userdict,
             unsaved: false,
             dicts,
-            dicts_generation: 0,
+            extra,
+            layers: BTreeMap::new(),
+            building: HashMap::new(),
+            builds: 0,
             client: None,
             marked: String::new(),
             caret: NSRect::ZERO,
@@ -179,6 +207,7 @@ impl AppState {
             timings: Timings::default(),
         };
         state.reload_settings();
+        state.reload_extra_dicts();
         // 有用户词库文件才挂上用户词库、开始学词；文件还不在就从空的开始
         if state.userdict.is_some() {
             state.session.set_user_words(Vec::new());
@@ -199,26 +228,78 @@ impl AppState {
         }
     }
 
-    /// 本地词库有改动就在后台重建，建好再换上，打字不用等。新引擎和现在的共用主词库，只换本地词库。
+    /// 本地词库有改动就在后台重建。
     fn reload_local_dicts(&mut self) {
-        let Some(paths) = self.dicts.as_mut().and_then(LocalDicts::reload) else { return };
-        self.dicts_generation += 1;
-        let generation = self.dicts_generation;
+        if let Some(paths) = self.dicts.as_mut().and_then(LocalDicts::reload) {
+            self.rebuild(vec![(Source::Local, paths)]);
+        }
+    }
+
+    /// 扩展词库打开了、下载了或重新下载了的，在后台重建；关了、删了的直接卸掉，内存就还回去了。
+    fn reload_extra_dicts(&mut self) {
+        let Some(extra) = self.extra.as_mut() else { return };
+        let mut builds = Vec::new();
+        let mut dropped = false;
+        for (file, path) in extra.reload(&self.session.settings().dicts) {
+            let source = Source::Extra(file);
+            match path {
+                Some(path) => builds.push((source, vec![path])),
+                None => {
+                    // 正在建的也作废
+                    self.building.remove(&source);
+                    dropped |= self.layers.remove(&source).is_some();
+                }
+            }
+        }
+        if dropped {
+            self.compose();
+        }
+        self.rebuild(builds);
+    }
+
+    /// 在后台把这几层词库一层一层建好，建好后拼到引擎上，打字不用等。一个接一个地建：同时建几个大词库，
+    /// 内存的最高点会叠在一起，释放了也不还给系统。读不了的文件跳过。
+    fn rebuild(&mut self, layers: Vec<(Source, Vec<PathBuf>)>) {
+        if layers.is_empty() {
+            return;
+        }
+        let jobs: Vec<(Source, u64, Vec<PathBuf>)> = layers
+            .into_iter()
+            .map(|(source, paths)| {
+                self.builds += 1;
+                self.building.insert(source, self.builds);
+                (source, self.builds, paths)
+            })
+            .collect();
         let engine = self.session.engine().clone();
         let building = self.app.background_executor().spawn(async move {
-            let started = Instant::now();
-            let sources = read_sources(&paths);
-            let engine = engine.with_local(&sources.iter().map(String::as_str).collect::<Vec<_>>());
-            (engine, started.elapsed())
+            jobs.into_iter()
+                .map(|(source, build, paths)| {
+                    let started = Instant::now();
+                    let sources = read_sources(&paths);
+                    let layer = engine.layer(&sources.iter().map(String::as_str).collect::<Vec<_>>());
+                    (source, build, layer, started.elapsed())
+                })
+                .collect::<Vec<_>>()
         });
-        self.when(building, move |state, (engine, elapsed)| {
-            // 这期间又改过、又开始建了的话，等那一次的
-            if state.dicts_generation == generation {
-                log::info!("本地词库载入：{} 个词，耗时 {elapsed:?}", engine.local().len());
-                state.session.set_engine(Arc::new(engine));
-                crate::release_memory();
+        self.when(building, |state, built| {
+            for (source, build, layer, elapsed) in built {
+                // 这期间又改过、又开始建了的话，等那一次的
+                if state.building.get(&source) == Some(&build) {
+                    log::info!("{source}载入：{} 个词，耗时 {elapsed:?}", layer.len());
+                    state.building.remove(&source);
+                    state.layers.insert(source, layer);
+                }
             }
+            state.compose();
+            crate::release_memory();
         });
+    }
+
+    /// 把现在的几层词库拼到引擎上。
+    fn compose(&mut self) {
+        let layers = self.layers.values().cloned().collect();
+        self.session.set_engine(Arc::new(self.session.engine().with_layers(layers)));
     }
 
     /// 过一会儿在主线程上对全局状态做 `f`。
@@ -249,7 +330,7 @@ impl AppState {
         let Some(file) = &mut self.userdict else { return };
         match file.save(self.session.engine().dictionary().table(), self.session.user_words()) {
             Ok(()) => self.unsaved = false,
-            Err(err) => log::warn!("用户词库存不进去：{err}"),
+            Err(err) => log::warn!("用户词库保存失败：{err}"),
         }
     }
 
@@ -297,22 +378,24 @@ impl AppState {
             }
             match built {
                 Ok(client) => {
-                    log::info!("AI 预测选词准备好了：{}，{}", client.provider().name(), client.model());
+                    log::info!("AI 预测选词已就绪：{}，{}", client.provider().name(), client.model());
                     state.ai = Some(Arc::new(client));
                 }
-                Err(err) => log::info!("AI 预测选词开着，但{err}"),
+                Err(err) => log::info!("AI 预测选词已开启，但{err}"),
             }
         });
     }
 
-    /// 停下来 `AI_PAUSE` 还没再动，就问 AI。每打一个键换一个计时器，前一个就取消了。
+    /// 停下来设置里的那么久（`pause_ms`）还没再动，就问 AI：一直在打的时候不问，免得白发请求；问出去以后又打了字，
+    /// 回来的答案就扔掉。每打一个键换一个计时器，前一个就取消了。
     fn schedule_ai(&mut self) {
         if self.ai.is_none() {
             return;
         }
         self.warm_ai();
         let generation = self.session.generation();
-        let pause = self.app.background_executor().timer(AI_PAUSE);
+        let pause = Duration::from_millis(self.session.settings().ai.pause_ms);
+        let pause = self.app.background_executor().timer(pause);
         self.ai_timer = Some(self.app.foreground_executor().spawn(async move {
             pause.await;
             let Some((ai, client)) = with_state(None, |state| state.ai_request(generation)) else { return };
@@ -358,7 +441,7 @@ impl AppState {
         let query = match self.session.ai_query() {
             Ok(query) => query,
             Err(reason) => {
-                log::info!("AI 预测选词：没问，{reason}");
+                log::info!("AI 预测选词：未发送请求，{reason}");
                 return;
             }
         };
@@ -385,28 +468,28 @@ impl AppState {
             Ok((pick, elapsed)) => {
                 let agreed = pick.index == 0;
                 let outcome = if !agreed && !pick.trusted() {
-                    "把握不够，没换"
+                    "置信度不足，未替换"
                 } else if self.session.offer_ai(query, pick.index, Instant::now()) {
                     self.redraw();
-                    if agreed { "和首选一样，标上 ✨" } else { "换了首选" }
+                    if agreed { "与首选一致，已标 ✨" } else { "已替换首选" }
                 } else {
-                    "输入已经变了，没用上"
+                    "输入已变化，已丢弃"
                 };
                 log::info!(
-                    "AI 预测选词 {elapsed:?}{}，挑了第 {} 句，把握 {}，{outcome}",
-                    if pick.alone { "（没有前文）" } else { "" },
+                    "AI 预测选词 {elapsed:?}{}，选择第 {} 句，置信度 {}，{outcome}",
+                    if pick.alone { "（无前文）" } else { "" },
                     pick.index + 1,
-                    pick.confidence.map_or("没给".into(), |confidence| format!("{confidence:.2}"))
+                    pick.confidence.map_or("未提供".into(), |confidence| format!("{confidence:.2}"))
                 );
             }
             // Key 不对：停掉问的那个，等设置窗口里换了 Key 再重建。这期间已经换上新的了就不动新的
             Err(kyme_ai::Error::Key) => {
-                log::warn!("AI 预测选词：API Key 不对");
+                log::warn!("AI 预测选词：API Key 无效");
                 if self.ai.as_ref().is_some_and(|ai| Arc::ptr_eq(ai, asked)) {
                     self.ai = None;
                 }
             }
-            Err(err) => log::warn!("AI 预测选词没成：{}", err.log_line()),
+            Err(err) => log::warn!("AI 预测选词请求失败：{}", err.log_line()),
         }
     }
 

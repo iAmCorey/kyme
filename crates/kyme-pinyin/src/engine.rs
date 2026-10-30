@@ -50,8 +50,10 @@ const VOWELS: &[u8] = b"aeiouv";
 const RAW_COST: f64 = 40.0;
 /// 组句时每一段取几个词参与比较。
 const LATTICE_WIDTH: usize = 3;
-/// 候选列表的上限。
+/// 候选列表里，选中后消耗同样多字母的候选最多几个。
 const MAX_CANDIDATES: usize = 60;
+/// 词频低于这个数的单字算生僻字，候选里排在常用的字词后面。自带词库里约四成单字低于它。
+const RARE_WEIGHT: f64 = 1000.0;
 /// 首选看搭配换字时，比较前几句。
 const COLLOCATION_SENTENCES: usize = 8;
 /// 不带用户词库时用的空词库。
@@ -103,6 +105,11 @@ impl Seg {
 
     fn prefix(start: usize, end: usize, set: SylSet, initial: u8, penalty: f64) -> Self {
         Seg { start, end, constraint: Constraint::Prefix { set, initial }, penalty, fixed: None }
+    }
+
+    /// 夹在中间的简拼：只打了开头的字母，后面紧接着别的字母（nhao 的 n）。末尾没打完的音节不算。
+    fn abbreviated(&self, bytes: &[u8]) -> bool {
+        matches!(self.constraint, Constraint::Prefix { .. }) && bytes.get(self.end).is_some_and(u8::is_ascii_lowercase)
     }
 }
 
@@ -239,6 +246,15 @@ fn cross_swaps(table: &SyllableTable, window: &str) -> Vec<(usize, SylId, SylId)
     found
 }
 
+/// 夹在中间的简拼 `input[pos..end]` 能和前后的字母拼成完整的音节：后面接着打全了以它开头的音节（shuo 的 s，
+/// 从 `pos` 起打全了的最长音节到 `syllable_end`），或者它是前面那个音节的最后一个字母（jian 的 n）。
+/// 打全了的音节就是想打它，这时不按简拼读：不然 duishuo 会读成 dui's'huo「对生活」，jianda 读成 jia'n'da「加拿大」。
+/// 往前越过分隔符的那几个字母本来就不是音节，不用另外管。
+fn glued(table: &SyllableTable, input: &str, pos: usize, end: usize, syllable_end: usize) -> bool {
+    syllable_end > end
+        || (end.saturating_sub(table.max_len())..pos).any(|from| table.exact(&input[from..end]).is_some())
+}
+
 /// QWERTY 键盘上和 `key` 相邻的字母键。
 fn neighbors(key: u8) -> &'static [u8] {
     match key {
@@ -292,11 +308,11 @@ pub struct Conversion {
     pub candidates: Vec<Candidate>,
 }
 
-/// 词图里的一个词：主词库、本地词库的词条，或者用户词库里的词。
+/// 词图里的一个词：主词库的词条，附加的第几层词库的词条，或者用户词库里的词。
 #[derive(Clone, Copy)]
 enum Word {
     Main(u32),
-    Local(u32),
+    Added(u16, u32),
     User(u32),
 }
 
@@ -305,7 +321,7 @@ enum Word {
 enum Words<'a> {
     /// 只用主词库：纠错得来的那一段，和拿来跟照着打的读法比的纠错整句，都只用它。
     Main,
-    /// 主词库，加上只进照着打的读法的本地词库和这份用户词库。
+    /// 主词库，加上只进照着打的读法的附加词库和这份用户词库。
     All(&'a UserDict),
 }
 
@@ -352,10 +368,12 @@ enum Step {
     Word { word: Word, segs: Vec<Seg> },
 }
 
+/// 各份数据都是共享的，复制一份很便宜。
+#[derive(Clone)]
 pub struct Engine {
     dict: Arc<Dictionary>,
-    /// 本地词库：自定义词库和导入的外部词库。和用户词一样只用在照着打的读法上。
-    local: Dictionary,
+    /// 附加的几层词库：本地词库（自定义的和导入的）、设置里打开的扩展词库。和用户词一样只用在照着打的读法上。
+    added: Arc<[Arc<Dictionary>]>,
     emoji: Arc<Emoji>,
     /// 主词库里字和字的搭配，组句时看相邻两个词接得顺不顺。
     pairs: Arc<Pairs>,
@@ -364,7 +382,7 @@ pub struct Engine {
 impl Engine {
     pub fn new(dict: Dictionary) -> Self {
         let pairs = Arc::new(Pairs::new(&dict));
-        Engine { dict: Arc::new(dict), local: Dictionary::from_rime_sources(&[]), emoji: Arc::default(), pairs }
+        Engine { dict: Arc::new(dict), added: Arc::new([]), emoji: Arc::default(), pairs }
     }
 
     /// 读一个数据目录：全部 `.dict.yaml`（按文件名排序）和 emoji 对照表 `emoji.txt`。
@@ -382,36 +400,37 @@ impl Engine {
         self
     }
 
-    /// 换上一套本地词库，每份是一个词库文件的内容（写法见 `local::parse_line`）。主词库和 emoji 不动，
-    /// 和这个引擎共用。没写拼音、拼音对不上的词按主词库补读音，补不出来的不要。
-    pub fn with_local(&self, sources: &[&str]) -> Engine {
-        Engine {
-            dict: self.dict.clone(),
-            local: local::build(&self.dict, sources),
-            emoji: self.emoji.clone(),
-            pairs: self.pairs.clone(),
-        }
+    /// 把几个词库文件的内容（写法见 `local::parse_line`）建成一层附加的词库，用 `with_layers` 换上。
+    /// 没写拼音、拼音对不上的词按主词库补读音，补不出来的不要。词多时要一秒多，在后台建。
+    pub fn layer(&self, sources: &[&str]) -> Arc<Dictionary> {
+        Arc::new(local::build(&self.dict, sources))
+    }
+
+    /// 换上这几层附加的词库，其余和这个引擎共用。
+    pub fn with_layers(&self, layers: Vec<Arc<Dictionary>>) -> Engine {
+        Engine { added: layers.into(), ..self.clone() }
     }
 
     pub fn dictionary(&self) -> &Dictionary {
         &self.dict
     }
 
-    pub fn local(&self) -> &Dictionary {
-        &self.local
-    }
-
-    /// 本地词库里这些词（文字，写的拼音）会按什么读音载入，和 `with_local` 定读音的办法一样。
+    /// 本地词库里这些词（文字，写的拼音）会按什么读音载入，和 `layer` 定读音的办法一样。
     /// 音节用空格隔开，定不出来是 None。设置窗口显示用。
     pub fn local_readings(&self, words: &[(&str, &str)]) -> Vec<Option<String>> {
         let read = |text, pinyin| local::reading(&self.dict, text, &local::syllables(pinyin).collect::<Vec<_>>());
         words.iter().map(|&(text, pinyin)| Some(self.dict.table().spell(&read(text, pinyin)?))).collect()
     }
 
-    /// 主词库或本地词库里文字和读音都对得上的这个词的代价，两边都有取低的。
+    /// 主词库或附加的词库里文字和读音都对得上的这个词的代价，几处都有取低的。
     pub(crate) fn word_cost(&self, text: &str, syllables: &[SylId]) -> Option<f64> {
         let cost = |dict: &Dictionary| dict.find(text, syllables).map(|entry| dict.cost(entry));
-        cost(&self.dict).into_iter().chain(cost(&self.local)).reduce(f64::min)
+        std::iter::once(&self.dict).chain(self.added.iter()).filter_map(|dict| cost(dict)).reduce(f64::min)
+    }
+
+    /// 有没有只进照着打的读法的词：附加的词库或这份用户词库。
+    fn has_added_words(&self, user: &UserDict) -> bool {
+        self.added.iter().any(|dict| !dict.is_empty()) || !user.is_empty()
     }
 
     pub fn emoji(&self) -> &Emoji {
@@ -565,11 +584,7 @@ impl Engine {
         // 用了纠错的话，要比照着打的读法明显更合理才算数（naanni 照着打是 na'an'ni「那按你」，
         // 不能被读成 nan'ni「南宁」）。拼不通的输入只能逐个字母原样保留，照着打的那边代价极高。
         // 比的时候纠错这边只用主词库：加进来的词只该让照着打的读法更占优
-        let best = if user.is_empty() && self.local.is_empty() {
-            best
-        } else {
-            self.solve(input, Reading::Corrected, Words::Main)
-        };
+        let best = if !self.has_added_words(user) { best } else { self.solve(input, Reading::Corrected, Words::Main) };
         if !best.corrected {
             return self.with_collocations(self.solve(input, Reading::Plain, all).conversion, all);
         }
@@ -715,34 +730,49 @@ impl Engine {
         }
 
         // 其余候选：从开头起能组成的词，覆盖得越长越靠前，同样长度按代价排。
-        // 只要在首选读法的音节边界上结束的（kaihui 不出「开花」，那会剩下打不出来的 ui）；
-        // 首选没用到纠错，就说明打得没错，也不出纠错得来的词
-        let mut words_from_start: Vec<(usize, f64, Word)> = Vec::new();
+        // 选了以后剩下的字母要还打得出字：结束在首选读法的音节边界上；照着打的词（没纠错、没夹着简拼）
+        // 也可以结束在别处，只要剩下的照着打读得通（wengan 首选是 weng'an「瓮安」，也出 wen「温」，剩下 gan；
+        // kaihui 不出「开户」，那会剩下打不出来的 i）。首选没用到纠错，就说明打得没错，也不出纠错得来的词
+        let readable = self.readable_rest(input);
+        let rare_cost = self.dict.cost_of_weight(RARE_WEIGHT);
+        let mut words_from_start: Vec<(usize, f64, bool, Word)> = Vec::new();
         for span in &spans_from_start {
             let corrected = span.segs.iter().any(|seg| seg.fixed.is_some());
-            if !boundaries.contains(&span.end) || (corrected && !sentence_corrected) {
+            let abbreviated = span.segs.iter().any(|seg| seg.abbreviated(bytes));
+            let rest_typable = boundaries.contains(&span.end) || (!corrected && !abbreviated && readable[span.end]);
+            if !rest_typable || (corrected && !sentence_corrected) {
                 continue;
             }
             for (word, cost) in self.lookup(span, MAX_CANDIDATES, words.for_span(span)) {
-                words_from_start.push((span.end, cost + span.penalty, word));
+                let rare = cost > rare_cost && self.word_text(user, word).chars().count() == 1;
+                words_from_start.push((span.end, cost + span.penalty, rare, word));
             }
         }
-        words_from_start.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.total_cmp(&b.1)));
+        words_from_start
+            .sort_by(|(end_a, cost_a, ..), (end_b, cost_b, ..)| end_b.cmp(end_a).then(cost_a.total_cmp(cost_b)));
 
         // 带着原样字母的整句没有完整的读音，不拿来学词
         let syllables = if has_raw { Vec::new() } else { syllables };
         let mut candidates = vec![Candidate { text: sentence, consumed: n, syllables }];
         let mut seen: HashSet<String> = candidates.iter().map(|c| c.text.clone()).collect();
-        for (end, _, word) in words_from_start {
-            if candidates.len() >= MAX_CANDIDATES {
-                break;
+        // 每种长度各自有上限：长的词再多，也要给短一些的读法留位置（jia 也选得到 ji'a 的「机」）
+        let mut per_end = vec![0; n + 1];
+        let mut kept: Vec<(bool, Candidate)> = Vec::new();
+        for (end, _, rare, word) in words_from_start {
+            if per_end[end] >= MAX_CANDIDATES {
+                continue;
             }
             let text = self.word_text(user, word);
             if seen.insert(text.to_string()) {
+                per_end[end] += 1;
                 let syllables = self.word_syllables(user, word).to_vec();
-                candidates.push(Candidate { text: text.to_string(), consumed: end, syllables });
+                kept.push((rare, Candidate { text: text.to_string(), consumed: end, syllables }));
             }
         }
+        // 留下哪些不看生不生僻，只调先后：生僻字排在所有常用的字词后面，免得把另一种读法的常用字挤到后面去
+        // （wengan 的「温」不排在 weng 的「蓊、𬭩、滃」后面）。排序是稳定的，其余的先后不变
+        kept.sort_by_key(|&(rare, _)| rare);
+        candidates.extend(kept.into_iter().map(|(_, candidate)| candidate));
 
         Solution {
             cost: total,
@@ -751,6 +781,22 @@ impl Engine {
             unfinished_from,
             conversion: Conversion { preedit, spelling, candidates },
         }
+    }
+
+    /// 每个位置往后剩下的字母，照着打（打全了的音节，末尾可以没打完）能不能读完。
+    fn readable_rest(&self, input: &str) -> Vec<bool> {
+        let bytes = input.as_bytes();
+        let n = bytes.len();
+        let mut readable = vec![false; n + 1];
+        readable[n] = true;
+        for pos in (0..n).rev() {
+            readable[pos] = if bytes[pos] == b'\'' {
+                readable[pos + 1]
+            } else {
+                self.seg_options(input, pos, Reading::Literal).iter().any(|choice| readable[choice.end()])
+            };
+        }
+        readable
     }
 
     /// 从 `start` 出发能切出的所有音节序列（最多 MAX_WORD_SYLS 个音节）。
@@ -804,10 +850,10 @@ impl Engine {
         let in_dict = |dict: &Dictionary| {
             dict.has_abbr_prefix(&initials) && exact.as_deref().is_none_or(|ids| dict.has_exact_prefix(ids))
         };
-        // 本地词库、学到的新词不在主词库里，也要查，不然会在切分时被剪掉。纠错的那一段也照样往下切，
+        // 附加的词库、学到的新词不在主词库里，也要查，不然会在切分时被剪掉。纠错的那一段也照样往下切，
         // 但查词时只查主词库，主词库的词本来就切得到，所以多切出来的段不会多出主词库的词
         in_dict(&self.dict)
-            || matches!(words, Words::All(user) if in_dict(&self.local)
+            || matches!(words, Words::All(user) if self.added.iter().any(|dict| in_dict(dict))
                 || (user.has_abbr_prefix(&initials) && exact.as_deref().is_none_or(|ids| user.has_exact_prefix(ids))))
     }
 
@@ -828,6 +874,8 @@ impl Engine {
                 options.push(Choice::single(Seg::exact(pos, end, id)));
             }
         }
+        // 从这里起打全了的最长音节到哪儿，没有就是 pos。简拼不能是它的开头
+        let syllable_end = options.iter().map(Choice::end).max().unwrap_or(pos);
 
         if reading == Reading::Corrected {
             // 这一段本身不是音节，但改一处就能对上：打反、按错相邻键、漏一个字母、连按两次
@@ -885,6 +933,9 @@ impl Engine {
             if end - pos == 2 && !table.is_initial(letters) {
                 continue;
             }
+            if end < run_end && glued(table, input, pos, end, syllable_end) {
+                continue;
+            }
             let Some(set) = table.prefix(letters) else { continue };
             // 末尾没打完的音节已经给出了同样的约束
             let duplicate = options.iter().any(|o| {
@@ -916,11 +967,10 @@ impl Engine {
         let mut found: Vec<(Word, f64)> =
             entries(&self.dict).into_iter().map(|entry| (Word::Main(entry), self.dict.cost(entry))).collect();
         let Words::All(user) = words else { return found };
-        if self.local.is_empty() && user.is_empty() {
+        if !self.has_added_words(user) {
             return found;
         }
-        // 同一个词可能主词库、本地词库、用户词库里都有，或者是另一个读音（「的」de 和 di 都对得上简拼 d），
-        // 留代价低的那个
+        // 同一个词可能几个词库里都有，或者是另一个读音（「的」de 和 di 都对得上简拼 d），留代价低的那个
         let mut add = |word: Word, cost: f64| {
             let text = self.word_text(user, word);
             match found.iter_mut().find(|(found, _)| self.word_text(user, *found) == text) {
@@ -929,8 +979,10 @@ impl Engine {
                 None => found.push((word, cost)),
             }
         };
-        for entry in entries(&self.local) {
-            add(Word::Local(entry), self.local.cost(entry));
+        for (layer, dict) in self.added.iter().enumerate() {
+            for entry in entries(dict) {
+                add(Word::Added(layer as u16, entry), dict.cost(entry));
+            }
         }
         let learned = match exact.as_deref() {
             Some(ids) => user.exact(ids),
@@ -947,7 +999,7 @@ impl Engine {
     fn word_text<'a>(&'a self, user: &'a UserDict, word: Word) -> &'a str {
         match word {
             Word::Main(entry) => self.dict.text(entry),
-            Word::Local(entry) => self.local.text(entry),
+            Word::Added(layer, entry) => self.added[usize::from(layer)].text(entry),
             Word::User(learned) => user.text(learned),
         }
     }
@@ -955,7 +1007,7 @@ impl Engine {
     fn word_syllables<'a>(&'a self, user: &'a UserDict, word: Word) -> &'a [SylId] {
         match word {
             Word::Main(entry) => self.dict.syllables(entry),
-            Word::Local(entry) => self.local.syllables(entry),
+            Word::Added(layer, entry) => self.added[usize::from(layer)].syllables(entry),
             Word::User(learned) => user.syllables(learned),
         }
     }
@@ -1083,10 +1135,15 @@ mod tests {
         assert_eq!(engine.convert_with("naanni", &user).spelling, "na'an'ni", "纠错的读法不用用户词");
     }
 
+    /// 换上用这份内容建的一层附加词库。
+    fn with_local(engine: Engine, source: &str) -> Engine {
+        engine.with_layers(vec![engine.layer(&[source])])
+    }
+
     #[test]
     fn local_words_can_be_typed() {
         // 本地词的音节要是主词库认得的：SAMPLE 里有 su、hong
-        let engine = engine().with_local(&["酥虹\tsu hong\n那安\n"]);
+        let engine = with_local(engine(), "酥虹\tsu hong\n那安\n");
         assert_eq!(engine.convert("suhong").candidates[0].text, "酥虹");
         assert!(texts(&engine.convert("suh")).contains(&"酥虹"), "简拼也能打出来");
         let c = engine.convert("naan");
@@ -1095,17 +1152,25 @@ mod tests {
     }
 
     #[test]
-    fn local_words_never_alter_correct_spelling() {
-        let engine = engine().with_local(&["南宁\tnan ning\t100000000\n难\tnan\t100000000\n"]);
+    fn added_words_never_alter_correct_spelling() {
+        let engine = with_local(engine(), "南宁\tnan ning\t100000000\n难\tnan\t100000000\n");
         // 切分可以变，打的字母一个都不能少：不能读成 nan'ni「南宁」
-        assert_eq!(engine.convert("naanni").spelling.replace('\'', ""), "naanni", "纠错的读法不用本地词");
+        assert_eq!(engine.convert("naanni").spelling.replace('\'', ""), "naanni", "纠错的读法不用加进来的词");
         assert_eq!(engine.convert("nanning").candidates[0].text, "南宁");
+    }
+
+    #[test]
+    fn every_added_layer_counts() {
+        let engine = engine();
+        let engine = engine.with_layers(vec![engine.layer(&["酥虹\tsu hong\n"]), engine.layer(&["素虹\tsu hong\n"])]);
+        let c = engine.convert("suhong");
+        assert!(texts(&c).contains(&"酥虹") && texts(&c).contains(&"素虹"), "两层的词都有：{:?}", texts(&c));
     }
 
     #[test]
     fn learned_local_words_start_from_their_local_cost() {
         let engine = Engine::new(Dictionary::from_rime_sources(&["鹏\tpeng\t5000\n"]));
-        let engine = engine.with_local(&["朋\tpeng\t100000\n"]);
+        let engine = with_local(engine, "朋\tpeng\t100000\n");
         assert_eq!(engine.convert("peng").candidates[0].text, "朋");
         let mut user = UserDict::default();
         user.learn(&engine, "朋", &syllables(&engine, "peng"), 0);
@@ -1172,6 +1237,86 @@ mod tests {
         let c = engine().convert("xian");
         assert_eq!(c.candidates[0].text, "先");
         assert!(texts(&c).contains(&"西安"));
+    }
+
+    #[test]
+    fn words_of_another_split_can_be_picked() {
+        // wengan 首选按 weng'an 是「瓮安」，wen'gan 那种切法的「温」也要能选，选了剩下 gan
+        let engine = Engine::new(Dictionary::from_rime_sources(&[
+            "瓮安\tweng an\t500\n翁\tweng\t300\n温\twen\t500\n感\tgan\t500\n文革\twen ge\t800\n",
+        ]));
+        let c = engine.convert("wengan");
+        assert_eq!(c.candidates[0].text, "瓮安");
+        let warm = c.candidates.iter().find(|c| c.text == "温").expect("出「温」");
+        assert_eq!(warm.consumed, "wen".len());
+        assert!(!texts(&c).contains(&"文革"), "g 和后面的 an 拼成 gan，不当简拼：{:?}", texts(&c));
+    }
+
+    #[test]
+    fn abbreviated_words_stay_as_alternatives() {
+        // 首选照着打，没拼成音节的字母当简拼的词照样排在后面：shenmesh 也出「什么时候」，ali 也出「案例」
+        let engine = Engine::new(Dictionary::from_rime_sources(&[
+            "什么是\tshen me shi\t100000\n什么时候\tshen me shi hou\t10\n阿里\ta li\t100000\n案例\tan li\t1000\n",
+        ]));
+        let c = engine.convert("shenmesh");
+        assert_eq!(c.candidates[0].text, "什么是");
+        assert!(texts(&c).contains(&"什么时候"), "{:?}", texts(&c));
+        let c = engine.convert("ali");
+        assert_eq!(c.candidates[0].text, "阿里");
+        assert!(texts(&c).contains(&"案例"), "{:?}", texts(&c));
+    }
+
+    #[test]
+    fn typed_syllables_are_not_read_as_abbreviations() {
+        let engine = Engine::new(Dictionary::from_rime_sources(&[
+            "对\tdui\t1000\n说\tshuo\t1000\n对生活\tdui sheng huo\t100000\n生活\tsheng huo\t100000\n\
+             活\thuo\t100\n加拿大\tjia na da\t100000\n简答\tjian da\t10\n加\tjia\t100\n你好\tni hao\t500\n",
+        ]));
+        let c = engine.convert("duishuo");
+        assert_eq!((c.candidates[0].text.as_str(), c.spelling.as_str()), ("对说", "dui'shuo"), "不读成 dui's'huo");
+        let c = engine.convert("jianda");
+        assert_eq!((c.candidates[0].text.as_str(), c.spelling.as_str()), ("简答", "jian'da"), "不读成 jia'n'da");
+        assert_eq!(engine.convert("nhao").candidates[0].text, "你好", "拼不成音节的字母照样按简拼读");
+    }
+
+    #[test]
+    fn rare_characters_follow_common_words_of_other_readings() {
+        let engine = Engine::new(Dictionary::from_rime_sources(&[
+            "瓮安\tweng an\t1420\n翁\tweng\t48774\n蓊\tweng\t394\n滃\tweng\t9\n温\twen\t447521\n感\tgan\t500000\n",
+        ]));
+        let c = engine.convert("wengan");
+        let at = |text: &str| texts(&c).iter().position(|t| *t == text).unwrap();
+        assert!(at("翁") < at("温"), "常用的字还是覆盖得越长越靠前：{:?}", texts(&c));
+        assert!(at("温") < at("蓊") && at("温") < at("滃"), "生僻字排在后面：{:?}", texts(&c));
+    }
+
+    #[test]
+    fn many_long_words_leave_room_for_other_readings() {
+        // jia 能接着打成 jian、jiang、jiao，这一长度的字远超上限，ji'a 的「机」也要留在候选里
+        let mut source: String = (0..200)
+            .map(|i| {
+                format!(
+                    "{}\tjia{}\t{}\n",
+                    char::from_u32(0x4E00 + i).unwrap(),
+                    ["", "n", "ng", "o"][i as usize % 4],
+                    100_000 + i
+                )
+            })
+            .collect();
+        source.push_str("机\tji\t5000\n啊\ta\t5000\n");
+        let engine = Engine::new(Dictionary::from_rime_sources(&[&source]));
+        let c = engine.convert("jia");
+        let machine = c.candidates.iter().find(|c| c.text == "机").expect("出「机」");
+        assert_eq!(machine.consumed, "ji".len());
+    }
+
+    #[test]
+    fn words_that_leave_untypable_letters_are_not_offered() {
+        let engine = Engine::new(Dictionary::from_rime_sources(&[
+            "开\tkai\t500\n会\thui\t500\n开会\tkai hui\t300\n开户\tkai hu\t300\n开花\tkai hua\t300\n",
+        ]));
+        let c = engine.convert("kaihui");
+        assert_eq!(texts(&c), ["开会", "开"], "开户剩下 i，开花要把 h 当简拼");
     }
 
     #[test]

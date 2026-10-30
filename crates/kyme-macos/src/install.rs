@@ -33,7 +33,7 @@ pub fn install(select: bool) -> i32 {
     let bundle = NSBundle::mainBundle();
     let path = bundle.bundlePath().to_string();
     let Some(bundle_id) = bundle.bundleIdentifier().map(|id| id.to_string()) else {
-        eprintln!("要在 Kyme.app 里运行：{path}");
+        eprintln!("须在 Kyme.app 中运行：{path}");
         return 1;
     };
     let Some(url) = CFURL::from_path(&path, true) else {
@@ -45,7 +45,7 @@ pub fn install(select: bool) -> i32 {
     println!("注册 {path}：{}", describe(status));
 
     let Some(modes) = retry(|| enable(&bundle_id)) else {
-        eprintln!("系统里没找到 {bundle_id} 的输入模式，可以注销后重新登录再试");
+        eprintln!("系统中未找到 {bundle_id} 的输入模式，请注销并重新登录后重试");
         return 1;
     };
     match modes.first() {
@@ -81,7 +81,7 @@ pub fn select_source(id: &str) -> i32 {
     });
     match status {
         Some(status) => println!("切换到 {id}：{}", describe(status)),
-        None => eprintln!("没找到输入源 {id}"),
+        None => eprintln!("未找到输入源 {id}"),
     }
     i32::from(selected.is_none())
 }
@@ -96,11 +96,11 @@ fn enable(bundle_id: &str) -> Option<Vec<String>> {
         let id = source_id(source);
         // 已经启用的不再启用一遍：每调一次 TISEnableInputSource，系统都会弹窗请用户确认
         if is_enabled(source) {
-            println!("{id} 已经启用");
+            println!("{id} 已启用");
         } else {
             // SAFETY: source 来自上面的列表，列表还活着
             let status = unsafe { TISEnableInputSource(source) };
-            println!("启用 {id}：{}（系统会弹窗请你确认）", describe(status));
+            println!("启用 {id}：{}（系统将弹窗请求确认）", describe(status));
         }
         // 和 bundle ID 相同的是输入法本身，其余是它的输入模式
         if id != bundle_id {

@@ -18,9 +18,9 @@ const DIR: &str = "dicts";
 const IMPORTED: &str = "imported";
 const CUSTOM: &str = "custom.dict.yaml";
 const CUSTOM_TEMPLATE: &str = "\
-# Kyme 自定义词库：一行一个词，存盘后切换一次输入框就能打出来。
-# 拼音可以不写，按常见读音补上；多音字、人名最好写上。词频可写可不写，越大越靠前。
-# 词、拼音、词频之间用 Tab 或空格隔开，例如：
+# Kyme 自定义词库：每行一个词条，保存后切换输入框即可生效。
+# 拼音可省略，省略时按常用读音补全；多音字和人名建议注明拼音。词频可省略，数值越大越靠前。
+# 词条、拼音、词频之间用 Tab 或空格分隔，例如：
 #
 # 鲲鹏
 # 曾小贤 zeng xiao xian
@@ -81,10 +81,10 @@ impl LocalDicts {
     }
 
     /// 自定义词库的文件。还没有就先写一份带说明的。
-    pub fn custom(&self) -> io::Result<PathBuf> {
+    pub fn custom(&self) -> Result<PathBuf, String> {
         let path = self.dir.join(CUSTOM);
         if !path.exists() {
-            disk::write_atomic(&path, CUSTOM_TEMPLATE, true)?;
+            disk::write_atomic(&path, CUSTOM_TEMPLATE, true).map_err(|err| format!("无法创建自定义词库文件：{err}"))?;
         }
         Ok(path)
     }
@@ -100,22 +100,22 @@ impl LocalDicts {
     pub fn add_custom(&self, input: &str) -> Result<(), String> {
         let input = input.trim();
         if input.is_empty() {
-            return Err("先填上词".into());
+            return Err("请输入词条".into());
         }
         if input.starts_with('#') || input.contains('\n') {
-            return Err("词不能以 # 开头".into());
+            return Err("词条不能以 # 开头".into());
         }
-        let row = local::parse_line(input).ok_or("词里要有汉字")?;
+        let row = local::parse_line(input).ok_or("词条须包含汉字")?;
         if !row.pinyin.iter().all(|syl| syl.bytes().all(|b| b.is_ascii_alphabetic())) {
-            return Err("词后面的拼音只能写字母".into());
+            return Err("拼音只能包含字母".into());
         }
         let weight = row.weight;
         let word = LocalWord::from(row);
         if self.custom_words().contains(&word) {
-            return Err(format!("「{}」已经在自定义词库里了", word.text));
+            return Err(format!("「{}」已在自定义词库中", word.text));
         }
-        let path = self.custom().map_err(|err| format!("建不了自定义词库的文件：{err}"))?;
-        let mut content = fs::read_to_string(&path).map_err(|err| format!("读不了自定义词库：{err}"))?;
+        let path = self.custom()?;
+        let mut content = fs::read_to_string(&path).map_err(|err| format!("无法读取自定义词库：{err}"))?;
         if !content.is_empty() && !content.ends_with('\n') {
             content.push('\n');
         }
@@ -125,7 +125,7 @@ impl LocalDicts {
             (pinyin, None) => writeln!(content, "{}\t{pinyin}", word.text),
             (pinyin, Some(weight)) => writeln!(content, "{}\t{pinyin}\t{weight}", word.text),
         };
-        disk::write_atomic(&path, &content, true).map_err(|err| format!("存不进去：{err}"))
+        disk::write_atomic(&path, &content, true).map_err(|err| format!("无法保存：{err}"))
     }
 
     /// 从自定义词库里删掉这个词。别的行，包括注释，都照旧。
@@ -163,15 +163,15 @@ impl LocalDicts {
     pub fn import(&self, source: &Path) -> Result<(), String> {
         let file =
             source.file_name().map_or_else(|| source.display().to_string(), |name| name.to_string_lossy().into());
-        let data = fs::read(source).map_err(|err| format!("读不了 {file}：{err}"))?;
+        let data = fs::read(source).map_err(|err| format!("无法读取 {file}：{err}"))?;
         let words = import::words(&data).map_err(|err| format!("{file}：{err}"))?;
         let name = [DICT_SUFFIX, ".scel", ".txt"].iter().find_map(|suffix| file.strip_suffix(suffix)).unwrap_or(&file);
-        let mut text = format!("# 从 {file} 导入\n");
+        let mut text = format!("# 导入自 {file}\n");
         for word in &words {
             let _ = writeln!(text, "{}\t{}\t{IMPORTED_WEIGHT}", word.text, word.pinyin);
         }
         let path = self.imported_dir().join(format!("{name}{DICT_SUFFIX}"));
-        disk::write_atomic(&path, &text, true).map_err(|err| format!("存不进去：{err}"))
+        disk::write_atomic(&path, &text, true).map_err(|err| format!("无法保存：{err}"))
     }
 
     /// 删掉一个导入的外部词库。

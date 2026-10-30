@@ -12,7 +12,7 @@ pub(crate) fn modified(path: &Path) -> Option<SystemTime> {
 }
 
 /// 先写到旁边的临时文件再换上，别的进程不会读到写了一半的文件。`private` 时只有自己能读写。
-pub(crate) fn write_atomic(path: &Path, text: &str, private: bool) -> io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, content: impl AsRef<[u8]>, private: bool) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
@@ -26,6 +26,14 @@ pub(crate) fn write_atomic(path: &Path, text: &str, private: bool) -> io::Result
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options.open(&tmp)?.write_all(text.as_bytes())?;
+    options.open(&tmp)?.write_all(content.as_ref())?;
     fs::rename(&tmp, path)
+}
+
+/// 删掉文件。本来就没有也算删掉了。
+pub(crate) fn remove(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
 }
